@@ -1,8 +1,8 @@
 mod cli;
+mod dataset;
 mod disk;
 mod fetch;
 mod jobs;
-mod meta;
 mod query;
 mod spend;
 mod verify;
@@ -56,8 +56,16 @@ async fn run() -> Result<Outcome> {
 
     let mut client = build_client(args.key.as_deref())?;
     match &args.command {
-        Some(Command::List(list_args)) => jobs::list(&mut client, list_args).await,
-        Some(Command::Meta(command)) => meta::run(&mut client, command).await,
+        Some(Command::List(list_args)) => match list_args.what {
+            cli::ListWhat::Jobs => jobs::list(&mut client, list_args).await,
+            cli::ListWhat::Datasets => {
+                if !list_args.state.is_empty() || list_args.since.is_some() {
+                    bail!("--state and --since filter jobs, not datasets");
+                }
+                dataset::list(&mut client).await
+            }
+        },
+        Some(Command::Dataset(dataset_args)) => dataset::run(&mut client, dataset_args).await,
         None => fetch::run(&mut client, &args.fetch).await,
     }
 }

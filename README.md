@@ -116,11 +116,12 @@ floor, rather than filling it and taking the rest of the machine down with it.
 ## `dbnget list`
 
 ```sh
-dbnget list
+dbnget list                           # the batch jobs on the account
 dbnget list --state queued,processing
+dbnget list datasets                  # the datasets the account can access
 ```
 
-Lists the jobs on the account: ID, state, dataset, schema, symbols qualified by their
+Bare `list` lists jobs: ID, state, dataset, schema, symbols qualified by their
 symbology (`ES.FUT` is one instrument as a raw symbol and every ES future as a parent
 symbol), range, cost and size. It is the tool for checking what already exists before
 submitting - a widened `--end` is a new job that re-purchases the old range, and
@@ -133,13 +134,28 @@ GLBX-20260805-JUBCRPRLG8  Done  GLBX.MDP3  trades  continuous:NQ.v.0,MNQ.v.0  20
 
 Long symbol lists are truncated with a count of what was left out.
 
-## `dbnget meta` - dataset metadata
+## `dbnget dataset` - one dataset's facts
 
 ```sh
-dbnget meta datasets
-dbnget meta schemas GLBX.MDP3
-dbnget meta range GLBX.MDP3
-dbnget meta publishers
+$ dbnget dataset GLBX.MDP3
+range:   2010-06-06 0:00:00.0 +00:00:00 .. 2026-08-13 11:30:00.0 +00:00:00
+schemas: mbo mbp-1 mbp-10 tbbo trades bbo-1s bbo-1m ohlcv-1s ohlcv-1m ohlcv-1h ohlcv-1d definition statistics status
+```
+
+The two facts needed to turn a dataset code into a fetch command: bounds for
+`--start`/`--end`, and values for `-s`. The names follow the Databento API docs:
+`list datasets` for the many, `dataset` for the one.
+
+`--publishers` shows the dataset's publisher table instead - venue by venue, the
+decoding of the `publisher_id` field in downloaded records. The upstream listing is
+global; dbnget filters it, because OPRA alone has twenty-odd publishers and the full
+dump buries every other dataset's:
+
+```sh
+$ dbnget dataset OPRA.PILLAR --publishers
+20	AMXO	OPRA - NYSE American Options
+21	XBOX	OPRA - BOX Options
+...
 ```
 
 ## Development

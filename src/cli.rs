@@ -29,11 +29,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// List the batch jobs on the account.
+    /// List the batch jobs on the account, or the datasets available to it.
     List(ListArgs),
-    /// Query dataset metadata.
-    #[command(subcommand)]
-    Meta(MetaCommand),
+    /// Show one dataset: its available range and schemas, or its publishers.
+    Dataset(DatasetArgs),
 }
 
 /// The default command: fetch data for a set of symbols.
@@ -101,6 +100,10 @@ pub struct FetchArgs {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
+    /// What to list.
+    #[arg(default_value = "jobs")]
+    pub what: ListWhat,
+
     /// Only show jobs in these states.
     #[arg(long, value_delimiter = ',')]
     pub state: Vec<CliJobState>,
@@ -110,22 +113,22 @@ pub struct ListArgs {
     pub since: Option<String>,
 }
 
-#[derive(Debug, Subcommand)]
-pub enum MetaCommand {
-    /// List the datasets available to the account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ListWhat {
+    /// The batch jobs on the account.
+    Jobs,
+    /// The datasets the account can access.
     Datasets,
-    /// List the schemas offered by a dataset.
-    Schemas {
-        /// Dataset code, e.g. `GLBX.MDP3`.
-        dataset: String,
-    },
-    /// Show the available date range of a dataset.
-    Range {
-        /// Dataset code, e.g. `GLBX.MDP3`.
-        dataset: String,
-    },
-    /// List the publishers across all datasets.
-    Publishers,
+}
+
+#[derive(Debug, Args)]
+pub struct DatasetArgs {
+    /// Dataset code, e.g. `GLBX.MDP3`.
+    pub dataset: String,
+
+    /// Show the dataset's publishers instead of its range and schemas.
+    #[arg(long)]
+    pub publishers: bool,
 }
 
 /// Mirrors the upstream encoding enum so that clap can derive `ValueEnum` for it.
