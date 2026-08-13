@@ -330,22 +330,84 @@ async fn wait_for_job(
     }
 }
 
+/// How much of the symbol list to show before summarising the rest.
+const SYMBOL_WIDTH: usize = 28;
+
 fn print_job(job: &BatchJob) {
     let cost = job
         .cost_usd
         .map_or_else(|| "-".to_owned(), |c| format!("${c:.2}"));
-    let size = job
-        .actual_size
-        .map_or_else(|| "-".to_owned(), |s| s.to_string());
+    let size = job.actual_size.map_or_else(|| "-".to_owned(), human_bytes);
     println!(
-        "{id}  {state:?}  {dataset} {schema} {start}..{end}  cost={cost} size={size}",
+        "{id}  {state:<10}  {dataset:<10} {schema:<10} {selection:<34}  {start}..{end}  {cost:>8}  {size:>9}",
         id = job.id,
-        state = job.state,
+        state = format!("{:?}", job.state),
         dataset = job.dataset,
-        schema = job.schema,
+        schema = job.schema.to_string(),
+        selection = selection(job),
         start = job.start.date(),
         end = job.end.date(),
     );
+}
+
+/// The symbols a job covers, qualified by the symbology they are written in.
+///
+/// `ES.FUT` means nothing on its own: as a raw symbol it is one instrument that may not
+/// exist, and as a parent symbol it is every ES future. The stype belongs next to it.
+fn selection(job: &BatchJob) -> String {
+    format!("{}:{}", job.stype_in, summarize_symbols(&job.symbols))
+}
+
+/// Renders a symbol list short enough to sit in a column, without hiding how many were
+/// left out.
+fn summarize_symbols(symbols: &Symbols) -> String {
+    let names: Vec<String> = match symbols {
+        Symbols::All => return "ALL_SYMBOLS".to_owned(),
+        Symbols::Symbols(list) => list.clone(),
+        Symbols::Ids(list) => list.iter().map(u32::to_string).collect(),
+    };
+    if names.is_empty() {
+        return "-".to_owned();
+    }
+
+    let mut out = String::new();
+    let mut shown = 0;
+    for name in &names {
+        if !out.is_empty() && out.len() + name.len() + 1 > SYMBOL_WIDTH {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(name);
+        shown += 1;
+    }
+    if shown < names.len() {
+        out.push_str(&format!("+{}", names.len() - shown));
+    }
+    out
+}
+
+/// Byte counts as humans read them. Batch jobs run to tens of gigabytes, where a raw
+/// count is just a wall of digits.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the value is formatted for humans, not compared"
+    )]
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +427,31 @@ mod tests {
         let right = Symbols::Symbols(vec!["ESM4".to_owned(), "NQM4".to_owned()]);
         assert!(!same_symbols(&left, &right));
         assert!(!same_symbols(&Symbols::All, &right));
+    }
+
+    #[test]
+    fn short_symbol_lists_are_shown_whole() {
+        let symbols = Symbols::Symbols(vec!["ES.FUT".to_owned(), "NQ.FUT".to_owned()]);
+        assert_eq!(summarize_symbols(&symbols), "ES.FUT,NQ.FUT");
+        assert_eq!(summarize_symbols(&Symbols::All), "ALL_SYMBOLS");
+    }
+
+    #[test]
+    fn long_symbol_lists_say_how_many_were_omitted() {
+        let names: Vec<String> = (0..20).map(|i| format!("SYM{i:02}")).collect();
+        let summary = summarize_symbols(&Symbols::Symbols(names));
+        assert!(
+            summary.contains('+'),
+            "{summary} should count the remainder"
+        );
+        assert!(summary.len() <= SYMBOL_WIDTH + 4, "{summary} is too wide");
+    }
+
+    #[test]
+    fn byte_counts_are_scaled() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(60_648_379_440), "56.5 GiB");
     }
 
     #[test]
