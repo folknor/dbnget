@@ -83,8 +83,63 @@ dbnget batch status JOB_ID
 dbnget batch download JOB_ID -o data/ --wait
 ```
 
-`--wait` and `--wait-and-download` poll every `--poll-interval` seconds until the job
-reaches `done`, and fail if it expires first.
+#### Exit codes, and driving a wave from the shell
+
+| Code | Meaning |
+|---|---|
+| 0 | Settled. The work is done. |
+| 3 | Nonterminal. Nothing is wrong; the data is not ready yet. Run the same command again. |
+| 1 | Failed. |
+
+A batch job that is still queued is neither a success nor a failure, so it gets its own
+code. That makes re-invoking `dbnget` the poll loop, and lets a shell drive a wave of
+jobs without `dbnget` having to track them:
+
+```sh
+# Phase 1: submit everything. Vendor-side preparation runs in parallel.
+for month in 2024-0{1,2,3,4,5,6}; do
+    dbnget batch submit -d GLBX.MDP3 -s trades -S ES.FUT --stype-in parent \
+        --start "$month-01" --end "$(date -d "$month-01 +1 month" +%F)" \
+        --confirm --max-dollars 50
+done
+
+# Phase 2: collect. Re-run until nothing exits 3.
+dbnget batch list --state done | while read -r job _; do
+    dbnget batch download "$job" -o data/
+done
+```
+
+Submitting the whole wave before waiting for any of it matters: the vendor prepares jobs
+in parallel, so a submit-wait-submit-wait loop leaves that capacity idle. Downloads, by
+contrast, are left serial on purpose - they are bandwidth-bound, so running them
+concurrently just divides one pipe and multiplies the partial files in flight.
+
+#### Waiting
+
+`--wait` and `--wait-and-download` poll until the job reaches `done`. The first poll is
+`--poll-interval` seconds away and the gap doubles up to `--max-poll-interval`, so a job
+that takes hours does not generate hundreds of pointless requests.
+
+Waiting stops after `--max-wait` minutes and exits 3. **That is not a failure** - a
+month of MBP-1 legitimately takes hours to prepare, the job keeps preparing whether or
+not anything is watching, and re-running the same command picks it back up. A job that
+expires before it could be downloaded *is* a failure.
+
+`--min-free-gb` refuses to start a download when the output filesystem is below the
+floor, rather than filling it and taking the rest of the machine down with it.
+
+#### Submitting is idempotent
+
+Before submitting, `dbnget` asks the vendor for the jobs already on the account and
+adopts any live job whose request matches - same dataset, schema, symbols, bounds,
+symbology and output format. Re-running a command whose first attempt succeeded picks
+the existing job back up instead of buying the same data twice.
+
+The match is on the request itself rather than on any local record, because the vendor
+is the only account of what was actually bought. Expired jobs are not adoptable: they
+have no downloadable files left. This is deliberately stateless - there is no local
+ledger - which leaves one gap: if the process dies in the window between the POST
+being charged and the job becoming visible in the listing, a re-run can submit twice.
 
 #### Submitting costs money, so it is gated
 

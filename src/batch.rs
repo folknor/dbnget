@@ -4,17 +4,19 @@ use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use databento::{
-    HistoricalClient,
+    HistoricalClient, Symbols,
     historical::batch::{BatchJob, DownloadParams, JobState, ListJobsParams, SubmitJobParams},
 };
-use tracing::info;
+use time::OffsetDateTime;
+use tracing::{info, warn};
 
 use crate::{
-    cli::{BatchCommand, BatchDownloadArgs, BatchListArgs, BatchSubmitArgs},
-    query, spend, verify,
+    Outcome,
+    cli::{BatchCommand, BatchDownloadArgs, BatchListArgs, BatchSubmitArgs, WaitArgs},
+    disk, query, spend, verify,
 };
 
-pub async fn run(client: &mut HistoricalClient, command: &BatchCommand) -> Result<()> {
+pub async fn run(client: &mut HistoricalClient, command: &BatchCommand) -> Result<Outcome> {
     match command {
         BatchCommand::Submit(args) => submit(client, args).await,
         BatchCommand::List(args) => list(client, args).await,
@@ -23,14 +25,21 @@ pub async fn run(client: &mut HistoricalClient, command: &BatchCommand) -> Resul
     }
 }
 
-async fn submit(client: &mut HistoricalClient, args: &BatchSubmitArgs) -> Result<()> {
+async fn submit(client: &mut HistoricalClient, args: &BatchSubmitArgs) -> Result<Outcome> {
     let params = submit_params(args)?;
-    let quote = spend::fetch(client, &query::metadata_params(&args.query)?).await?;
 
+    // Ask the vendor what we already own before paying for it again. Without this, a
+    // re-run of a command whose first attempt succeeded buys the same data twice.
+    if let Some(existing) = find_existing(client, &params).await? {
+        info!(job_id = %existing.id, state = ?existing.state, "adopting matching job");
+        return settle(client, &existing.id, args).await;
+    }
+
+    let quote = spend::fetch(client, &query::metadata_params(&args.query)?).await?;
     if !args.confirm {
         println!("would submit: {} {} {quote}", params.dataset, params.schema);
         println!("pass --confirm --max-dollars USD to submit");
-        return Ok(());
+        return Ok(Outcome::Settled);
     }
     spend::approve(&quote, args.max_dollars)?;
 
@@ -42,12 +51,22 @@ async fn submit(client: &mut HistoricalClient, args: &BatchSubmitArgs) -> Result
     println!("{}", job.id);
     print_job(&job);
 
+    settle(client, &job.id, args).await
+}
+
+/// Waits for and downloads a job, when the caller asked for that.
+async fn settle(
+    client: &mut HistoricalClient,
+    job_id: &str,
+    args: &BatchSubmitArgs,
+) -> Result<Outcome> {
     let Some(out) = args.wait_and_download.as_deref() else {
-        return Ok(());
+        return Ok(Outcome::Settled);
     };
-    let poll = Duration::from_secs(args.poll_interval);
-    wait_for_job(client, &job.id, poll).await?;
-    download_files(client, &job.id, out, None).await
+    if wait_for_job(client, job_id, &args.wait).await? == Outcome::Nonterminal {
+        return Ok(Outcome::Nonterminal);
+    }
+    download_files(client, job_id, out, None, args.min_free_gb).await
 }
 
 fn submit_params(args: &BatchSubmitArgs) -> Result<SubmitJobParams> {
@@ -68,7 +87,90 @@ fn submit_params(args: &BatchSubmitArgs) -> Result<SubmitJobParams> {
         .build())
 }
 
-async fn list(client: &mut HistoricalClient, args: &BatchListArgs) -> Result<()> {
+/// Finds a live job that would deliver exactly what this submission asks for.
+///
+/// Matching is on the request, not on any name we gave it, because the vendor is the
+/// only record of what was actually bought. An expired job is not adoptable: it has no
+/// downloadable files left.
+async fn find_existing(
+    client: &mut HistoricalClient,
+    params: &SubmitJobParams,
+) -> Result<Option<BatchJob>> {
+    let states = vec![JobState::Done, JobState::Processing, JobState::Queued];
+    let listing = ListJobsParams::builder().states(states).build();
+    let jobs = client
+        .batch()
+        .list_jobs(&listing)
+        .await
+        .context("listing existing jobs before submitting")?;
+
+    let mut matches: Vec<BatchJob> = jobs
+        .into_iter()
+        .filter(|job| job_matches(job, params))
+        .collect();
+    matches.sort_by_key(|job| (state_rank(job.state), job.ts_received));
+    Ok(matches.pop())
+}
+
+/// Prefers a job that is ready over one still being prepared, and the newest of equals.
+fn state_rank(state: JobState) -> u8 {
+    match state {
+        JobState::Done => 3,
+        JobState::Processing => 2,
+        JobState::Queued => 1,
+        JobState::Expired => 0,
+    }
+}
+
+/// Whether an existing job would deliver the same bytes this submission would buy.
+///
+/// Both the selection and the output format have to agree. A job covering the right
+/// records in the wrong encoding is not a substitute for the one being submitted.
+fn job_matches(job: &BatchJob, params: &SubmitJobParams) -> bool {
+    job.dataset == params.dataset
+        && job.schema == params.schema
+        && job.stype_in == params.stype_in
+        && job.stype_out == params.stype_out
+        && job.encoding == params.encoding
+        && job.compression == params.compression
+        && job.split_duration == params.split_duration
+        && job.split_symbols == params.split_symbols
+        && job.limit == params.limit
+        && same_instant(job.start, params.date_time_range.start)
+        && same_instant(job.end, params.date_time_range.end)
+        && same_symbols(&job.symbols, &params.symbols)
+}
+
+fn same_instant(left: OffsetDateTime, right: OffsetDateTime) -> bool {
+    left.unix_timestamp_nanos() == right.unix_timestamp_nanos()
+}
+
+/// Compares symbol selections as sets, case-insensitively.
+///
+/// The vendor echoes back what it parsed, so neither the ordering nor the letter case
+/// of the original request survives to be compared directly.
+fn same_symbols(left: &Symbols, right: &Symbols) -> bool {
+    match (left, right) {
+        (Symbols::All, Symbols::All) => true,
+        (Symbols::Symbols(left), Symbols::Symbols(right)) => {
+            let mut left: Vec<String> = left.iter().map(|s| s.to_uppercase()).collect();
+            let mut right: Vec<String> = right.iter().map(|s| s.to_uppercase()).collect();
+            left.sort_unstable();
+            right.sort_unstable();
+            left == right
+        }
+        (Symbols::Ids(left), Symbols::Ids(right)) => {
+            let mut left = left.clone();
+            let mut right = right.clone();
+            left.sort_unstable();
+            right.sort_unstable();
+            left == right
+        }
+        _ => false,
+    }
+}
+
+async fn list(client: &mut HistoricalClient, args: &BatchListArgs) -> Result<Outcome> {
     let states = if args.state.is_empty() {
         None
     } else {
@@ -95,10 +197,10 @@ async fn list(client: &mut HistoricalClient, args: &BatchListArgs) -> Result<()>
     for job in &jobs {
         print_job(job);
     }
-    Ok(())
+    Ok(Outcome::Settled)
 }
 
-async fn status(client: &mut HistoricalClient, job_id: &str) -> Result<()> {
+async fn status(client: &mut HistoricalClient, job_id: &str) -> Result<Outcome> {
     let job = client
         .batch()
         .get_job_details(job_id)
@@ -114,15 +216,27 @@ async fn status(client: &mut HistoricalClient, job_id: &str) -> Result<()> {
     for file in &files {
         println!("  {} ({} bytes)", file.filename, file.size);
     }
-    Ok(())
+
+    Ok(match job.state {
+        JobState::Done => Outcome::Settled,
+        _ => Outcome::Nonterminal,
+    })
 }
 
-async fn download(client: &mut HistoricalClient, args: &BatchDownloadArgs) -> Result<()> {
-    if args.wait {
-        let poll = Duration::from_secs(args.poll_interval);
-        wait_for_job(client, &args.job_id, poll).await?;
+async fn download(client: &mut HistoricalClient, args: &BatchDownloadArgs) -> Result<Outcome> {
+    if args.wait
+        && wait_for_job(client, &args.job_id, &args.wait_args).await? == Outcome::Nonterminal
+    {
+        return Ok(Outcome::Nonterminal);
     }
-    download_files(client, &args.job_id, &args.out, args.filename.as_deref()).await
+    download_files(
+        client,
+        &args.job_id,
+        &args.out,
+        args.filename.as_deref(),
+        args.min_free_gb,
+    )
+    .await
 }
 
 async fn download_files(
@@ -130,10 +244,12 @@ async fn download_files(
     job_id: &str,
     out: &Path,
     filename: Option<&str>,
-) -> Result<()> {
+    min_free_gb: u64,
+) -> Result<Outcome> {
     tokio::fs::create_dir_all(out)
         .await
         .with_context(|| format!("creating output directory {}", out.display()))?;
+    disk::check_floor(out, min_free_gb)?;
 
     let manifest = client
         .batch()
@@ -169,15 +285,24 @@ async fn download_files(
     for path in &paths {
         println!("{}", path.display());
     }
-    Ok(())
+    Ok(Outcome::Settled)
 }
 
-/// Polls until the job is downloadable, or fails once it can no longer become one.
+/// Polls until the job is downloadable, the wait budget runs out, or it can no longer
+/// become downloadable.
+///
+/// Running out of budget is not an error. A month of MBP-1 legitimately takes hours to
+/// prepare, so the answer is "not yet", and the job keeps preparing whether or not
+/// anything is watching.
 async fn wait_for_job(
     client: &mut HistoricalClient,
     job_id: &str,
-    poll_interval: Duration,
-) -> Result<()> {
+    wait: &WaitArgs,
+) -> Result<Outcome> {
+    let deadline = OffsetDateTime::now_utc() + time::Duration::seconds(wait.max_wait_secs());
+    let mut interval = Duration::from_secs(wait.poll_interval);
+    let ceiling = Duration::from_secs(wait.max_poll_interval);
+
     loop {
         let job = client
             .batch()
@@ -185,7 +310,7 @@ async fn wait_for_job(
             .await
             .with_context(|| format!("polling job {job_id}"))?;
         match job.state {
-            JobState::Done => return Ok(()),
+            JobState::Done => return Ok(Outcome::Settled),
             JobState::Expired => bail!("job {job_id} expired before it could be downloaded"),
             state => info!(
                 job_id,
@@ -194,7 +319,14 @@ async fn wait_for_job(
                 "waiting"
             ),
         }
-        tokio::time::sleep(poll_interval).await;
+
+        if OffsetDateTime::now_utc() + interval >= deadline {
+            warn!(job_id, "still preparing when the wait budget ran out");
+            return Ok(Outcome::Nonterminal);
+        }
+        tokio::time::sleep(interval).await;
+        // Back off so a job that takes hours does not make hundreds of requests.
+        interval = (interval * 2).min(ceiling);
     }
 }
 
@@ -214,4 +346,31 @@ fn print_job(job: &BatchJob) {
         start = job.start.date(),
         end = job.end.date(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbol_sets_ignore_order_and_case() {
+        let left = Symbols::Symbols(vec!["esm4".to_owned(), "NQM4".to_owned()]);
+        let right = Symbols::Symbols(vec!["nqm4".to_owned(), "ESM4".to_owned()]);
+        assert!(same_symbols(&left, &right));
+    }
+
+    #[test]
+    fn different_symbol_sets_do_not_match() {
+        let left = Symbols::Symbols(vec!["ESM4".to_owned()]);
+        let right = Symbols::Symbols(vec!["ESM4".to_owned(), "NQM4".to_owned()]);
+        assert!(!same_symbols(&left, &right));
+        assert!(!same_symbols(&Symbols::All, &right));
+    }
+
+    #[test]
+    fn a_ready_job_outranks_one_still_preparing() {
+        assert!(state_rank(JobState::Done) > state_rank(JobState::Processing));
+        assert!(state_rank(JobState::Processing) > state_rank(JobState::Queued));
+        assert!(state_rank(JobState::Queued) > state_rank(JobState::Expired));
+    }
 }

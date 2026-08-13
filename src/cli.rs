@@ -151,9 +151,13 @@ pub struct BatchSubmitArgs {
     #[arg(long, value_name = "DIR")]
     pub wait_and_download: Option<PathBuf>,
 
-    /// Seconds between polls while waiting for a job.
-    #[arg(long, default_value_t = 15, value_name = "SECS")]
-    pub poll_interval: u64,
+    #[command(flatten)]
+    pub wait: WaitArgs,
+
+    /// Refuse to start a download when the output filesystem has less than this many
+    /// gibibytes free. Zero disables the check.
+    #[arg(long, default_value_t = 1, value_name = "GIB")]
+    pub min_free_gb: u64,
 
     /// Actually submit the job. Without this the command prices the request and stops.
     #[arg(long)]
@@ -163,6 +167,35 @@ pub struct BatchSubmitArgs {
     /// quote above the cap refuses rather than truncating the request.
     #[arg(long, value_name = "USD", requires = "confirm")]
     pub max_dollars: Option<f64>,
+}
+
+/// How long, and how often, to poll a job that is still being prepared.
+#[derive(Debug, Args)]
+pub struct WaitArgs {
+    /// Seconds to wait before the first poll. The interval then doubles, up to
+    /// `--max-poll-interval`.
+    #[arg(long, default_value_t = 20, value_name = "SECS")]
+    pub poll_interval: u64,
+
+    /// The longest gap between polls, in seconds.
+    #[arg(long, default_value_t = 120, value_name = "SECS")]
+    pub max_poll_interval: u64,
+
+    /// Give up waiting after this many minutes and exit 3. The job keeps preparing;
+    /// re-running the same command picks it back up. Zero waits indefinitely.
+    #[arg(long, default_value_t = 1440, value_name = "MINS")]
+    pub max_wait: u64,
+}
+
+impl WaitArgs {
+    /// The wait budget in seconds. Zero means no budget, expressed as a bound far
+    /// beyond any job's lifetime rather than as a separate code path.
+    pub fn max_wait_secs(&self) -> i64 {
+        if self.max_wait == 0 {
+            return i64::MAX / 2;
+        }
+        i64::try_from(self.max_wait.saturating_mul(60)).unwrap_or(i64::MAX / 2)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -193,9 +226,13 @@ pub struct BatchDownloadArgs {
     #[arg(long)]
     pub wait: bool,
 
-    /// Seconds between polls while waiting for a job.
-    #[arg(long, default_value_t = 15, value_name = "SECS")]
-    pub poll_interval: u64,
+    #[command(flatten)]
+    pub wait_args: WaitArgs,
+
+    /// Refuse to start a download when the output filesystem has less than this many
+    /// gibibytes free. Zero disables the check.
+    #[arg(long, default_value_t = 1, value_name = "GIB")]
+    pub min_free_gb: u64,
 }
 
 #[derive(Debug, Subcommand)]

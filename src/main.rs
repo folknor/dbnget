@@ -1,11 +1,14 @@
 mod batch;
 mod cli;
+mod disk;
 mod get;
 mod meta;
 mod query;
 mod session;
 mod spend;
 mod verify;
+
+use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -14,8 +17,41 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::{Cli, Command};
 
+/// How a command finished.
+///
+/// A batch job that is still queued is not a failure and not a success: nothing is
+/// wrong, the data just is not ready. It gets its own exit code so a shell loop can
+/// tell "come back later" from "give up", which is what makes re-invoking the tool the
+/// poll loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The work is done.
+    Settled,
+    /// The work is unfinished but healthy; run the same command again later.
+    Nonterminal,
+}
+
+impl From<Outcome> for ExitCode {
+    fn from(outcome: Outcome) -> Self {
+        match outcome {
+            Outcome::Settled => Self::SUCCESS,
+            Outcome::Nonterminal => Self::from(3),
+        }
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(outcome) => outcome.into(),
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<Outcome> {
     let args = Cli::parse();
     init_tracing(args.verbose);
 

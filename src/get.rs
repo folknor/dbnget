@@ -10,7 +10,7 @@ use databento::{
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 use tracing::info;
 
-use crate::{cli::GetArgs, query, session};
+use crate::{Outcome, cli::GetArgs, query, session};
 
 /// The stamp format for file names: sortable, and free of separators that would
 /// collide with the dotted fields around it.
@@ -18,7 +18,7 @@ const STAMP: &[FormatItem<'_>] = format_description!("[year][month][day]T[hour][
 
 /// Runs the `get` command: one request and one file per session when `--split` is set,
 /// a single request for the whole range otherwise.
-pub async fn run(client: &mut HistoricalClient, args: &GetArgs) -> Result<()> {
+pub async fn run(client: &mut HistoricalClient, args: &GetArgs) -> Result<Outcome> {
     tokio::fs::create_dir_all(&args.out)
         .await
         .with_context(|| format!("creating output directory {}", args.out.display()))?;
@@ -46,7 +46,7 @@ pub async fn run(client: &mut HistoricalClient, args: &GetArgs) -> Result<()> {
     }
 
     info!(written, skipped, empty, "download complete");
-    Ok(())
+    Ok(Outcome::Settled)
 }
 
 /// Splits the request into the chunks that will each become one file.

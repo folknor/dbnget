@@ -4,17 +4,19 @@ use anyhow::{Context, Result};
 use databento::HistoricalClient;
 
 use crate::{
+    Outcome,
     cli::{MetaCommand, QueryArgs},
     query, spend,
 };
 
-pub async fn run(client: &mut HistoricalClient, command: &MetaCommand) -> Result<()> {
+pub async fn run(client: &mut HistoricalClient, command: &MetaCommand) -> Result<Outcome> {
     match command {
         MetaCommand::Datasets => datasets(client).await,
         MetaCommand::Schemas { dataset } => schemas(client, dataset).await,
         MetaCommand::Range { dataset } => range(client, dataset).await,
         MetaCommand::Publishers => publishers(client).await,
-    }
+    }?;
+    Ok(Outcome::Settled)
 }
 
 /// Prints the record count, billable size and price of a query without fetching it.
@@ -22,7 +24,7 @@ pub async fn run(client: &mut HistoricalClient, command: &MetaCommand) -> Result
 /// A quote of $0.00 is not self-explanatory. Under an active subscription a covered
 /// request prices at zero because it is already paid for, but a request whose symbols
 /// match nothing prices at zero too, so the record count is printed alongside.
-pub async fn cost(client: &mut HistoricalClient, args: &QueryArgs) -> Result<()> {
+pub async fn cost(client: &mut HistoricalClient, args: &QueryArgs) -> Result<Outcome> {
     let params = query::metadata_params(args)?;
     let quote = spend::fetch(client, &params).await?;
 
@@ -33,7 +35,7 @@ pub async fn cost(client: &mut HistoricalClient, args: &QueryArgs) -> Result<()>
         println!();
         println!("This query matches no records. A $0.00 quote here means empty, not free.");
     }
-    Ok(())
+    Ok(Outcome::Settled)
 }
 
 async fn datasets(client: &mut HistoricalClient) -> Result<()> {
