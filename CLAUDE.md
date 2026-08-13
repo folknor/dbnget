@@ -60,6 +60,11 @@ the relevant docs, where it is reviewable and versioned with the code.
   work this way. Discarding a dirty file is an operation only the user may ask for
   explicitly.
 - Always run `brokkr fmt` before a commit.
+- Update `CHANGELOG.md`. A user-visible change - a flag, an output, a behavior, a
+  refusal - gets an entry in the same commit that makes it. Internal refactors that
+  change nothing observable do not. Until the first release actually ships, there is
+  nothing to record changes against: work folds into the initial release entry rather
+  than accumulating an unreleased section.
 - Never commit markdown changes alone - bundle them with the related code commit;
   tag along dirty markdown when committing other changes.
 - Write substantive engineering-focused commit messages.
@@ -70,9 +75,31 @@ the relevant docs, where it is reviewable and versioned with the code.
   DELETING AND RECREATING the GitHub repo, because a force-push leaves the old
   commit reachable by SHA.
 
-### Publishing
+### Releasing
 
-- `cargo publish` is NEVER run without an explicit instruction to publish. "Get
-  ready to publish" means metadata and packaging only. Verify with
-  `cargo package --list` that no key, no `scratch/`, and no `.reference/` is in the
-  tarball.
+`cargo publish` is NEVER run without an explicit instruction to publish. "Get ready to
+release" means everything up to step 4 and nothing after it. Ask before crossing that
+line, every time - a published version cannot be deleted, only yanked, and the version
+number is burned either way.
+
+The order is deliberate: everything reversible happens before anything that is not.
+
+1. **Green and clean.** `brokkr check` passes, `brokkr fmt` has run, and `git status`
+   is clean. Never release from a dirty tree.
+2. **Version and changelog.** Bump `version` in `Cargo.toml`. Move the changelog's
+   unreleased entries under the new version with today's date, and add the link
+   reference at the bottom. Commit both together.
+3. **Inspect the package.** `cargo package --list` - confirm no `databento.key`, no
+   `scratch/`, no `.reference/`, no stray key in any file. Then `cargo publish
+   --dry-run`, which builds the crate exactly as crates.io will.
+4. **Push.** `git push`. The commit must be on the remote before the tag points at it.
+5. **Tag.** `git tag -a v<VERSION> -m "dbnget v<VERSION>"` then `git push origin
+   v<VERSION>`. Annotated, not lightweight, and `v`-prefixed to match the changelog
+   link.
+6. **Publish.** `cargo publish`. Irreversible. Only with explicit instruction.
+7. **Release notes.** `gh release create v<VERSION> --title "v<VERSION>" --notes
+   "<the changelog section for this version>"`. Nothing new in the notes - if it is
+   worth saying, it belongs in the changelog first.
+
+If step 6 fails after step 5 succeeded, fix forward: delete and re-push the tag if the
+commit has to change, rather than publishing a version whose tag points somewhere else.

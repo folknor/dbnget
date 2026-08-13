@@ -8,7 +8,7 @@ Built with LLMs. See [LLM.md](LLM.md).
 ## Install
 
 ```sh
-brokkr install
+cargo install dbnget
 ```
 
 ### The API key
@@ -238,9 +238,13 @@ $ dbnget dataset OPRA.PILLAR --publishers
 ## Development
 
 ```sh
-brokkr check   # gremlins + clippy + tests
-brokkr fmt
+cargo clippy --all-targets
+cargo test
+cargo fmt
 ```
+
+The lint list in `Cargo.toml` is strict on purpose, and clippy is expected to pass
+clean.
 
 ## License
 

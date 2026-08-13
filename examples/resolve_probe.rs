@@ -10,7 +10,7 @@
 //! Resolve is a metadata endpoint, so every call here is free. Run with:
 //!
 //! ```sh
-//! brokkr run resolve_probe
+//! cargo run --example resolve_probe
 //! ```
 
 use anyhow::{Context, Result};

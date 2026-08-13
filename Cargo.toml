@@ -9,7 +9,23 @@ repository = "https://github.com/folknor/dbnget"
 readme = "README.md"
 keywords = ["databento", "market-data", "trading", "finance", "dbn"]
 categories = ["command-line-utilities", "finance"]
-exclude = ["/scratch", "/.reference", "databento.key", "*.key"]
+exclude = [
+    # Never publishable, whatever else changes here.
+    "/scratch",
+    "/.reference",
+    "databento.key",
+    "*.key",
+    # Agent and tooling configuration. Meaningless outside this checkout, and
+    # `brokkr` and `review` are not tools a consumer of the crate has.
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    "/brokkr.toml",
+    "/.review.toml",
+    "/.gitignore",
+    # Development probe: needs an API key on disk and a network round trip, so it
+    # cannot run for anyone installing this from crates.io.
+    "/examples",
+]
 
 [dependencies]
 anyhow = "1"
