@@ -1,0 +1,96 @@
+//! `dbnget meta` and `dbnget cost` - the read-only metadata endpoints.
+
+use anyhow::{Context, Result};
+use databento::HistoricalClient;
+
+use crate::{
+    cli::{MetaCommand, QueryArgs},
+    query,
+};
+
+pub async fn run(client: &mut HistoricalClient, command: &MetaCommand) -> Result<()> {
+    match command {
+        MetaCommand::Datasets => datasets(client).await,
+        MetaCommand::Schemas { dataset } => schemas(client, dataset).await,
+        MetaCommand::Range { dataset } => range(client, dataset).await,
+        MetaCommand::Publishers => publishers(client).await,
+    }
+}
+
+/// Prints the record count, billable size and price of a query without fetching it.
+pub async fn cost(client: &mut HistoricalClient, args: &QueryArgs) -> Result<()> {
+    let params = query::metadata_params(args)?;
+
+    let records = client
+        .metadata()
+        .get_record_count(&params)
+        .await
+        .context("fetching record count")?;
+    let billable = client
+        .metadata()
+        .get_billable_size(&params)
+        .await
+        .context("fetching billable size")?;
+    let usd = client
+        .metadata()
+        .get_cost(&params)
+        .await
+        .context("fetching cost")?;
+
+    println!("records:       {records}");
+    println!("billable size: {billable} bytes");
+    println!("cost:          ${usd:.2}");
+    Ok(())
+}
+
+async fn datasets(client: &mut HistoricalClient) -> Result<()> {
+    let datasets = client
+        .metadata()
+        .list_datasets(None)
+        .await
+        .context("listing datasets")?;
+    for dataset in &datasets {
+        println!("{dataset}");
+    }
+    Ok(())
+}
+
+async fn schemas(client: &mut HistoricalClient, dataset: &str) -> Result<()> {
+    let schemas = client
+        .metadata()
+        .list_schemas(dataset)
+        .await
+        .with_context(|| format!("listing schemas for {dataset}"))?;
+    for schema in &schemas {
+        println!("{schema}");
+    }
+    Ok(())
+}
+
+async fn range(client: &mut HistoricalClient, dataset: &str) -> Result<()> {
+    let range = client
+        .metadata()
+        .get_dataset_range(dataset)
+        .await
+        .with_context(|| format!("fetching range for {dataset}"))?;
+    println!("{} .. {}", range.start, range.end);
+    Ok(())
+}
+
+async fn publishers(client: &mut HistoricalClient) -> Result<()> {
+    let publishers = client
+        .metadata()
+        .list_publishers()
+        .await
+        .context("listing publishers")?;
+    for publisher in &publishers {
+        println!(
+            "{id}\t{dataset}\t{venue}\t{description}",
+            id = publisher.publisher_id,
+            dataset = publisher.dataset,
+            venue = publisher.venue,
+            description = publisher.description,
+        );
+    }
+    Ok(())
+}
