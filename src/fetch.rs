@@ -13,14 +13,15 @@ use databento::{
     HistoricalClient,
     dbn::{Compression, Encoding, SType, Schema},
     historical::{
-        DateTimeRange,
+        DateRange, DateTimeRange,
         batch::{BatchJob, JobState, SplitDuration, SubmitJobParams},
         metadata::GetQueryParams,
+        symbology::ResolveParams,
         timeseries::GetRangeParams,
     },
 };
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{Outcome, cli::FetchArgs, jobs, query, spend, verify};
 
@@ -69,8 +70,8 @@ fn validate(args: &FetchArgs) -> Result<Request> {
         schema,
         symbols: query::symbols(&args.symbols)?,
         range: query::date_time_range(start, args.end.as_deref())?,
-        stype_in: args.stype_in,
-        stype_out: args.stype_out,
+        stype_in: args.stype_in.into(),
+        stype_out: args.stype_out.into(),
         limit: args.limit,
         encoding: args.format.into(),
     })
@@ -82,11 +83,57 @@ async fn cost(client: &mut HistoricalClient, request: &Request) -> Result<Outcom
     println!("records:       {}", quote.records);
     println!("billable size: {} bytes", quote.billable_bytes);
     println!("cost:          ${:.2}", quote.usd);
+
+    if let Some(summary) = resolve_summary(client, request).await {
+        println!("symbols:       {summary}");
+    }
+
     if quote.is_empty() {
         println!();
         println!("This query matches no records. A $0.00 quote here means empty, not free.");
     }
     Ok(Outcome::Settled)
+}
+
+/// How the request's symbols resolve, for `--cost` to report alongside the price.
+///
+/// Symbology resolution is a free metadata call, and it answers what a price cannot: a
+/// $0.00 quote reads the same whether a subscription covers the request or the symbols
+/// select nothing at all, and `ES.FUT` under the wrong symbology is the ordinary way to
+/// reach the second case.
+///
+/// Strictly advisory. The endpoint refuses symbology combinations that fetch perfectly
+/// well - `parent` to `raw_symbol` among them - so a failure here says nothing about
+/// whether the request is valid, and must not change what `--cost` reports or exits.
+async fn resolve_summary(client: &mut HistoricalClient, request: &Request) -> Option<String> {
+    let params = ResolveParams::builder()
+        .dataset(&request.dataset)
+        .symbols(request.symbols.clone())
+        .stype_in(request.stype_in)
+        .stype_out(request.stype_out)
+        .date_range(DateRange::from(
+            request.range.start.date()..request.range.end.date(),
+        ))
+        .build();
+
+    match client.symbology().resolve(&params).await {
+        Ok(resolution) => {
+            let mut summary = format!(
+                "{} resolved, {} partial, {} not found",
+                resolution.mappings.len(),
+                resolution.partial.len(),
+                resolution.not_found.len()
+            );
+            if !resolution.not_found.is_empty() {
+                summary.push_str(&format!(" ({})", resolution.not_found.join(", ")));
+            }
+            Some(summary)
+        }
+        Err(err) => {
+            debug!(%err, "symbology resolution unavailable for this request");
+            None
+        }
+    }
 }
 
 /// The default path: reconcile the request against the vendor's job listing.
@@ -374,8 +421,8 @@ mod tests {
             schema: None,
             start: None,
             end: None,
-            stype_in: SType::RawSymbol,
-            stype_out: SType::InstrumentId,
+            stype_in: crate::cli::CliSType::RawSymbol,
+            stype_out: crate::cli::CliSType::InstrumentId,
             limit: None,
             format: crate::cli::CliFormat::Dbn,
             output: PathBuf::from("."),

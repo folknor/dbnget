@@ -50,6 +50,48 @@ the existing job instead of buying the same data twice. The one gap is the windo
 between the submit POST being charged and the job appearing in the listing: a process
 that dies in it can submit twice on re-run.
 
+### Symbology: `--stype-in` and `--stype-out`
+
+`--stype-in` says how to read the symbols you passed. The same string means different
+things in different symbologies, and the difference is what you are billed for:
+
+| Symbology | A symbol means | Example |
+|---|---|---|
+| `raw_symbol` (default) | one exact symbol as the publisher writes it | `ESM4` is the June 2024 E-mini |
+| `parent` | a whole product family | `ES.FUT` is every ES future |
+| `continuous` | a rolling series, stitched across expiries | `ES.v.0` is front-month ES by volume |
+| `instrument_id` | Databento's numeric ids | `3403` |
+
+`ES.FUT` is the cautionary case: one instrument as a `raw_symbol`, the entire ES curve
+as a `parent`. Same string, wildly different bill. There are eight more symbologies for
+equities and cross-vendor identifiers - `nasdaq_symbol`, `cms_symbol`, `isin`,
+`us_code`, `bbg_comp_id`, `bbg_comp_ticker`, `figi`, `figi_ticker` - and `dbnget --help`
+lists them all.
+
+`--stype-out` says how symbols appear in the delivered records. It defaults to
+`instrument_id`, and the names are recoverable either way: DBN files carry the
+id-to-symbol mappings in their metadata header, and CSV and JSON get a symbol column by
+default. Leave it alone unless you know otherwise - symbol maps and the `--cost` symbol
+lookup both require `instrument_id` on one side.
+
+Both flags are part of what identifies a job, so changing either makes a different
+request rather than the same one spelled differently.
+
+#### Finding out what exists
+
+There is no free enumeration of a dataset. `dbnget list datasets` gives the dataset
+codes and `dbnget dataset CODE` gives its range and schemas, but nothing lists the
+instruments:
+
+- The symbology lookup behind `--cost` resolves symbols you can already name. It will
+  not enumerate: `ALL_SYMBOLS` is refused outright on GLBX.MDP3.
+- A `parent` selection does expand to its family, which is the closest thing to free
+  enumeration - `--cost` reports the count.
+- The complete answer is the `definition` schema, one record per instrument carrying
+  its symbol, product code, expiry and contract terms. That is a normal data request,
+  so it is billed, but it is a per-day catalogue rather than a tick stream and `--cost`
+  will price it first.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -93,10 +135,27 @@ than hiding it behind a generic refusal.
 dbnget ES.v.0 --stype-in continuous -d GLBX.MDP3 -s mbp-1 --start 2024-05-01 --end 2024-06-01 --cost
 ```
 
-Prints the record count, billable size and USD cost, and stops. Never queues, and the
-spend gate does not apply - it is a quote, not a purchase. A query matching no records
-says so, because a $0.00 quote means either "covered by a subscription" or "matches
-nothing" and only the record count tells them apart.
+Prints the record count, billable size, USD cost and how the symbols resolve, then
+stops. Never queues, and the spend gate does not apply - it is a quote, not a purchase.
+A query matching no records says so, because a $0.00 quote means either "covered by a
+subscription" or "matches nothing" and only the record count tells them apart.
+
+```
+$ dbnget ES.FUT --stype-in parent -d GLBX.MDP3 -s tbbo --start 2022-06-01 --end 2022-06-30 --cost
+records:       13011614
+billable size: 1040929120 bytes
+cost:          $27.14
+symbols:       37 resolved, 5 partial, 0 not found
+```
+
+The `symbols` line is a free symbology lookup, and it says two things the price cannot.
+How far the selection expands: `ES.FUT` is 37 instruments across that month, which is
+why it costs what it does. And how many resolve for only part of the range - those 5 are
+contracts that do not exist for the whole window, so some of what you are buying is a
+range your symbols do not span.
+
+It is advisory. The endpoint refuses some symbology combinations that fetch perfectly
+well, so when it cannot answer, the line is simply absent and the quote stands.
 
 ### `--immediate`: stream it now
 
@@ -182,3 +241,7 @@ $ dbnget dataset OPRA.PILLAR --publishers
 brokkr check   # gremlins + clippy + tests
 brokkr fmt
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
