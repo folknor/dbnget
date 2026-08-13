@@ -49,6 +49,17 @@ opening session and pulls in the same slice of the session after it.
 maintenance break is not part of any session and is never requested, so consecutive
 chunks do not tile the calendar.
 
+Measured against `GLBX.MDP3` tbbo for `ES.FUT` on Sunday 2026-08-09:
+
+| Window (UTC) | Records |
+|---|---|
+| 00:00 → 22:00 | 0 |
+| 22:00 → 24:00 | 5,919 |
+
+22:00 UTC is 17:00 CDT. The week's first session opens on Sunday evening, so splitting
+on UTC midnight files two hours of Monday's session under Sunday and cuts the session in
+half.
+
 #### Skipping empty sessions
 
 `--skip-empty` asks `metadata.get_record_count` whether each chunk holds anything, and
@@ -58,6 +69,24 @@ round-trip per chunk.
 
 Note that `metadata.get_dataset_condition` cannot be used for this: it reports dataset
 ingestion status, and answers `available` for Christmas Day and for every Saturday.
+
+The pre-pass is sequential, so a year of sessions is a few hundred round-trips before
+the first byte lands. Worth it when closures are common, not worth it for a handful of
+chunks you already know are populated.
+
+#### `get` does not gate spending
+
+`batch submit` refuses to charge you without `--confirm` and `--max-dollars`. **`get`
+has no such gate** and starts billing immediately. Price the range with `cost` first if
+that matters:
+
+```sh
+dbnget cost -d GLBX.MDP3 -s mbp-1 -S ES.v.0 --stype-in continuous \
+    --start 2024-05-01 --end 2024-06-01
+```
+
+The protection is on the path that is easier to undo rather than the one that bills
+fastest, which is backwards. Fixing it means a `--max-dollars` on `get` too.
 
 ### `cost` - price a query before running it
 
@@ -82,6 +111,16 @@ dbnget batch list --state queued,processing
 dbnget batch status JOB_ID
 dbnget batch download JOB_ID -o data/ --wait
 ```
+
+`batch list` shows the symbols a job covers, qualified by their symbology, because
+`ES.FUT` is one instrument as a raw symbol and every ES future as a parent symbol:
+
+```
+GLBX-20260812-MUCPBX5U6K  Done  GLBX.MDP3  tbbo    continuous:ES.v.0   2025-08-12..2025-08-31   $0.00  347.8 MiB
+GLBX-20260805-JUBCRPRLG8  Done  GLBX.MDP3  trades  continuous:NQ.v.0,MNQ.v.0  2026-07-05..2026-07-19  $24.06  1.8 GiB
+```
+
+Long symbol lists are truncated with a count of what was left out.
 
 #### Exit codes, and driving a wave from the shell
 
@@ -147,6 +186,18 @@ being charged and the job becoming visible in the listing, a re-run can submit t
 `--confirm` and `--max-dollars`, and refuses if the live quote exceeds the cap rather
 than truncating the request to fit. A quote that is not a finite number is refused, as
 is a request that matches no records.
+
+`--max-dollars 0` is the useful setting on a subscription. Databento prices a request
+your subscription already covers at exactly $0.00 and an uncovered one at list price, so
+a zero cap means "fetch only what I have already paid for":
+
+```
+$ dbnget batch submit -d GLBX.MDP3 -s tbbo -S ES.FUT --stype-in parent \
+      --start 2020-05-04 --end 2020-05-05 --confirm --max-dollars 0
+Error: quoted $0.79 exceeds the --max-dollars cap of $0.00
+```
+
+The same request inside the entitlement window quotes $0.00 and passes.
 
 #### Downloaded files are verified
 
