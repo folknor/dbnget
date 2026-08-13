@@ -22,11 +22,11 @@ use databento::{
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 use tracing::{info, warn};
 
-use crate::{Outcome, cli::FetchArgs, jobs, query, spend};
+use crate::{Outcome, cli::FetchArgs, jobs, query, spend, verify};
 
 /// The stamp format for `--immediate` file names: sortable, and free of separators
 /// that would collide with the dotted fields around it.
-const STAMP: &[FormatItem<'_>] = format_description!("[year][month][day]T[hour][minute]");
+const STAMP: &[FormatItem<'_>] = format_description!("[year][month][day]T[hour][minute][second]");
 
 /// A fully validated, normalized request. Normalization matters because adoption keys
 /// on the request: a near-miss (unsorted symbols, un-normalized dates) re-buys.
@@ -101,6 +101,19 @@ async fn reconcile(
     if let Some(job) = jobs::find_live(&listing, &params) {
         return match job.state {
             JobState::Done => {
+                // The zero-record rule is a property of the request, not of the path
+                // that reaches it. Checking it only before submitting would let an
+                // empty job already sitting on the account be adopted and exit 0,
+                // which is the same "symbology or date-range mistake delivered as an
+                // empty file" the spend gate exists to refuse. Refusing rather than
+                // ignoring the job matters: ignoring it would fall through and submit
+                // a duplicate.
+                if job.record_count == Some(0) {
+                    bail!(
+                        "job {} matches this request but holds no records - check the symbols, dataset and date range",
+                        job.id
+                    );
+                }
                 info!(job_id = %job.id, "adopting finished job");
                 jobs::download(client, &job.id, &args.output, args.min_free_gb).await
             }
@@ -181,7 +194,25 @@ async fn immediate(
     tokio::fs::create_dir_all(&args.output)
         .await
         .with_context(|| format!("creating output directory {}", args.output.display()))?;
-    let path = args.output.join(request.file_name());
+    let path = args.output.join(request.file_name()?);
+
+    // This request has already been billed by the time a byte arrives, so silently
+    // truncating an existing result would destroy data the account paid for twice: once
+    // for the file being overwritten, once for the one overwriting it.
+    verify::no_symlink(&path)?;
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        bail!(
+            "{} already exists; move it aside or choose another --output rather than paying for it again",
+            path.display()
+        );
+    }
+
+    // Stream to a sibling and rename on success. A stream killed part way through
+    // otherwise leaves a short file under the final name, and nothing downstream can
+    // tell it from a complete one - there is no manifest to verify an immediate
+    // download against.
+    let partial = path.with_extension("part");
+    verify::no_symlink(&partial)?;
 
     info!(path = %path.display(), "streaming");
     let params = GetRangeParams::builder()
@@ -195,10 +226,14 @@ async fn immediate(
         .build();
     let decoder = client
         .timeseries()
-        .get_range_to_file(&params.with_path(&path))
+        .get_range_to_file(&params.with_path(&partial))
         .await
-        .with_context(|| format!("downloading {}", path.display()))?;
+        .with_context(|| format!("downloading {}", partial.display()))?;
     drop(decoder);
+
+    tokio::fs::rename(&partial, &path)
+        .await
+        .with_context(|| format!("renaming {} to {}", partial.display(), path.display()))?;
 
     println!("{}", path.display());
     Ok(Outcome::Settled)
@@ -236,18 +271,35 @@ impl Request {
 
     /// Names an `--immediate` file after the query it holds, both bounds included, so
     /// a directory of them stays self-describing.
-    fn file_name(&self) -> PathBuf {
+    ///
+    /// The stamps carry seconds, and sub-second bounds carry their nanoseconds too:
+    /// minute precision let two differently-priced RFC 3339 requests land on one name,
+    /// and the second one to run would silently replace the first.
+    ///
+    /// The result is validated as a plain file name rather than trusted. `dataset` is
+    /// a free-form string from the command line, and it is being joined onto
+    /// `--output`: a leading separator would make the join absolute and ignore the
+    /// output directory entirely.
+    fn file_name(&self) -> Result<PathBuf> {
         let dataset = self.dataset.replace('.', "_");
         let start = stamp(self.range.start);
         let end = stamp(self.range.end);
-        PathBuf::from(format!("{dataset}.{}.{start}-{end}.dbn.zst", self.schema))
+        let name = format!("{dataset}.{}.{start}-{end}.dbn.zst", self.schema);
+        verify::checked_file_name(&name)
+            .with_context(|| format!("`{}` does not make a usable file name", self.dataset))?;
+        Ok(PathBuf::from(name))
     }
 }
 
+/// A bound as a sortable stamp, to whatever precision it actually carries.
 fn stamp(instant: OffsetDateTime) -> String {
-    instant
+    let base = instant
         .format(STAMP)
-        .unwrap_or_else(|_| instant.unix_timestamp().to_string())
+        .unwrap_or_else(|_| instant.unix_timestamp().to_string());
+    match instant.nanosecond() {
+        0 => base,
+        nanos => format!("{base}_{nanos:09}"),
+    }
 }
 
 #[cfg(test)]
@@ -277,9 +329,41 @@ mod tests {
     #[test]
     fn immediate_file_names_carry_both_bounds() {
         assert_eq!(
-            request().file_name().to_str().unwrap(),
-            "GLBX_MDP3.trades.20240430T2200-20240501T2100.dbn.zst"
+            request().file_name().unwrap().to_str().unwrap(),
+            "GLBX_MDP3.trades.20240430T220000-20240501T210000.dbn.zst"
         );
+    }
+
+    /// Two requests that differ only below the minute must not name the same file: the
+    /// second one billed would otherwise truncate the first one's data.
+    #[test]
+    fn sub_minute_bounds_do_not_collide() {
+        let mut coarse = request();
+        coarse.range = DateTimeRange::from(
+            datetime!(2024-05-01 12:00:00 UTC)..datetime!(2024-05-01 13:00 UTC),
+        );
+        let mut fine = request();
+        fine.range = DateTimeRange::from(
+            datetime!(2024-05-01 12:00:30 UTC)..datetime!(2024-05-01 13:00 UTC),
+        );
+        assert_ne!(coarse.file_name().unwrap(), fine.file_name().unwrap());
+
+        let mut nanos = request();
+        nanos.range = DateTimeRange::from(
+            datetime!(2024-05-01 12:00:00.5 UTC)..datetime!(2024-05-01 13:00 UTC),
+        );
+        assert_ne!(coarse.file_name().unwrap(), nanos.file_name().unwrap());
+    }
+
+    /// A dataset carrying a separator would otherwise escape `--output`, and a leading
+    /// one would make the join absolute.
+    #[test]
+    fn a_dataset_that_would_escape_the_output_directory_is_refused() {
+        for bad in ["/etc/passwd", "../../evil", "a/b"] {
+            let mut req = request();
+            bad.clone_into(&mut req.dataset);
+            assert!(req.file_name().is_err(), "should have refused `{bad}`");
+        }
     }
 
     #[test]

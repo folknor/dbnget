@@ -26,9 +26,11 @@ brokkr install
 dbnget ESM4 NQM4 -d GLBX.MDP3 -s trades --start 2024-05-01 --end 2024-05-08 -o data
 ```
 
-Symbols are positional. A bare `--start` date with no `--end` covers exactly that one
-UTC day. `--format dbn|csv|json` picks the delivered encoding, always zstd-compressed
-and split into one file per day.
+Symbols are positional. An omitted `--end` means exactly 24 hours after `--start` - for
+a plain `YYYY-MM-DD` start that is that one UTC day, and for an RFC 3339 start it is the
+24 hours following that instant, not the rest of the calendar day. `--format
+dbn|csv|json` picks the delivered encoding, always zstd-compressed and split into one
+file per day.
 
 The command is the state machine. The whole request is one batch job on the vendor's
 account (Databento keeps a multi-symbol submit as a single job), and each run
@@ -76,7 +78,9 @@ pass --spend USD to approve the charge
 `--spend USD` caps what a run may charge. A quote above the cap refuses rather than
 truncating the request to fit; a non-finite quote is refused; and a request matching
 zero records is an error, not a free pass - a $0.00 quote can mean "covered" or
-"matches nothing", and the record count disambiguates.
+"matches nothing", and the record count disambiguates. That rule is a property of the
+request rather than of the path reaching it, so an empty job already sitting on the
+account is refused on adoption too, not just before a submit.
 
 The vendor deletes a job's prepared files about 30 days after completion. An expired
 job is not adoptable, so re-running its command quotes full price like a fresh query
@@ -89,14 +93,24 @@ than hiding it behind a generic refusal.
 dbnget ES.v.0 --stype-in continuous -d GLBX.MDP3 -s mbp-1 --start 2024-05-01 --end 2024-06-01 --cost
 ```
 
-Prints the record count, billable size and USD cost, and stops. Never queues.
+Prints the record count, billable size and USD cost, and stops. Never queues, and the
+spend gate does not apply - it is a quote, not a purchase. A query matching no records
+says so, because a $0.00 quote means either "covered by a subscription" or "matches
+nothing" and only the record count tells them apart.
 
 ### `--immediate`: stream it now
 
 One plain streaming request, written straight to disk as
-`DATASET.SCHEMA.START-END.dbn.zst`. DBN only - the streaming API does not deliver
-CSV or JSON. The spend gate applies exactly as above; streaming bills the moment the
-request is issued.
+`DATASET.SCHEMA.START-END.dbn.zst`, where the bounds carry seconds (and nanoseconds
+when they have them) so two requests that differ below the minute cannot land on one
+name. DBN only - the streaming API does not deliver CSV or JSON. The spend gate applies
+exactly as above; streaming bills the moment the request is issued.
+
+Because the request is already billed by the time a byte arrives, an existing file at
+that name is an error rather than something to overwrite, and the stream lands on a
+`.part` sibling that is renamed only once it completes - there is no manifest to verify
+an immediate download against, so a half-written file must never be left under the
+final name.
 
 There is no session splitting, resume, or empty-day pre-pass here. That machinery
 existed when streaming was the primary path; with batch as the default, the vendor
@@ -112,8 +126,16 @@ one by whatever runs next. Files ending in `.zst` are also checked for a zstd fr
 header, and manifest filenames are rejected unless they are plain file names, since
 they are joined onto the output directory.
 
+Files are downloaded one at a time, each from the manifest dbnget validated itself and
+each verified before the next one starts. The client's download-all re-fetches the
+manifest internally and builds paths from that second copy, so the names checked would
+not be the names written.
+
 `--min-free-gb` refuses to start a download when the output filesystem is below the
-floor, rather than filling it and taking the rest of the machine down with it.
+floor, rather than filling it and taking the rest of the machine down with it. The check
+runs before every file and counts that file's size against the floor, since a job is
+many files and a run that only checks once can start each file legally and still finish
+below the floor.
 
 ## `dbnget list`
 

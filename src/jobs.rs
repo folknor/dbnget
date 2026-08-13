@@ -3,9 +3,10 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use databento::{
     HistoricalClient, Symbols,
+    dbn::Encoding,
     historical::batch::{BatchJob, DownloadParams, JobState, ListJobsParams, SubmitJobParams},
 };
 use time::OffsetDateTime;
@@ -99,10 +100,26 @@ fn job_matches(job: &BatchJob, params: &SubmitJobParams) -> bool {
         && job.compression == params.compression
         && job.split_duration == params.split_duration
         && job.split_symbols == params.split_symbols
+        && job.split_size == params.split_size
+        && job.delivery == params.delivery
+        && job.pretty_px == params.pretty_px
+        && job.pretty_ts == params.pretty_ts
+        && job.map_symbols == effective_map_symbols(params)
         && job.limit == params.limit
         && same_instant(job.start, params.date_time_range.start)
         && same_instant(job.end, params.date_time_range.end)
         && same_symbols(&job.symbols, &params.symbols)
+}
+
+/// What `map_symbols` will actually be once the vendor applies its default.
+///
+/// The submission carries an `Option<bool>` and the job echoes back a concrete `bool`,
+/// so comparing them directly would never match on the default path. The default is
+/// encoding-dependent: text encodings get the symbol column, DBN does not.
+fn effective_map_symbols(params: &SubmitJobParams) -> bool {
+    params
+        .map_symbols
+        .unwrap_or(matches!(params.encoding, Encoding::Csv | Encoding::Json))
 }
 
 fn same_instant(left: OffsetDateTime, right: OffsetDateTime) -> bool {
@@ -115,6 +132,11 @@ fn same_instant(left: OffsetDateTime, right: OffsetDateTime) -> bool {
 /// of the original request survives to be compared directly. A multi-symbol job can
 /// come back as one comma-joined string rather than a list, so elements are split on
 /// commas before comparing.
+///
+/// Duplicates are collapsed, which is what makes this a set comparison rather than a
+/// sorted-list comparison. A request written `ESM4 ESM4 NQM4` selects exactly what
+/// `ESM4 NQM4` selects, and the vendor is free to echo back either form; leaving the
+/// repeat in would fail the match and re-buy data the account already owns.
 fn same_symbols(left: &Symbols, right: &Symbols) -> bool {
     fn normalize(list: &[String]) -> Vec<String> {
         let mut out: Vec<String> = list
@@ -124,6 +146,7 @@ fn same_symbols(left: &Symbols, right: &Symbols) -> bool {
             .filter(|s| !s.is_empty())
             .collect();
         out.sort_unstable();
+        out.dedup();
         out
     }
 
@@ -135,6 +158,8 @@ fn same_symbols(left: &Symbols, right: &Symbols) -> bool {
             let mut right = right.clone();
             left.sort_unstable();
             right.sort_unstable();
+            left.dedup();
+            right.dedup();
             left == right
         }
         _ => false,
@@ -149,6 +174,11 @@ pub async fn download(
     out: &Path,
     min_free_gb: u64,
 ) -> Result<Outcome> {
+    // The job id becomes a path component, and it arrives from the same response the
+    // filenames do. It gets the same treatment.
+    let job_id = verify::checked_file_name(job_id)
+        .context("the vendor's job id is not usable as a directory name")?;
+
     tokio::fs::create_dir_all(out)
         .await
         .with_context(|| format!("creating output directory {}", out.display()))?;
@@ -159,23 +189,45 @@ pub async fn download(
         .list_files(job_id)
         .await
         .with_context(|| format!("listing files for job {job_id}"))?;
+    if manifest.is_empty() {
+        bail!(
+            "job {job_id} is done but delivered no files; it bought nothing, so there is nothing to verify"
+        );
+    }
     for file in &manifest {
         verify::checked_file_name(&file.filename)?;
     }
 
-    let params = DownloadParams::builder()
-        .output_dir(out)
-        .job_id(job_id)
-        .build();
-    client
-        .batch()
-        .download(&params)
-        .await
-        .with_context(|| format!("downloading job {job_id}"))?;
-
     // The client puts a job's files in a directory named after the job.
     let job_dir = out.join(job_id);
-    let paths = verify::job_files(&job_dir, &manifest).await?;
+    verify::no_symlink(&job_dir)?;
+
+    // One file at a time, from the manifest validated above. Handing the whole job to
+    // the client's download-all instead would re-fetch the manifest inside it and build
+    // every path from that second response, so the names checked here would not be the
+    // names written - and the free-space floor would be consulted once for a job that
+    // writes tens of gigabytes across many files.
+    let mut paths = Vec::with_capacity(manifest.len());
+    for desc in &manifest {
+        let name = verify::checked_file_name(&desc.filename)?;
+        disk::check_room_for(out, min_free_gb, desc.size)?;
+
+        let path = job_dir.join(name);
+        verify::no_symlink(&path)?;
+
+        let params = DownloadParams::builder()
+            .output_dir(out)
+            .job_id(job_id)
+            .filename_to_download(name)
+            .build();
+        client
+            .batch()
+            .download(&params)
+            .await
+            .with_context(|| format!("downloading {name} from job {job_id}"))?;
+
+        paths.push(verify::file(&path, desc).await?);
+    }
 
     for path in &paths {
         println!("{}", path.display());
@@ -265,7 +317,85 @@ fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
+    use databento::{
+        dbn::{Compression, SType, Schema},
+        historical::{
+            DateTimeRange,
+            batch::{Delivery, SplitDuration},
+        },
+    };
+    use time::macros::datetime;
+
     use super::*;
+
+    /// A submission with every field at the default the fetch path builds, mutated by
+    /// the caller. Built as a literal rather than through the builder so a field added
+    /// upstream fails this file to compile - which is the point, since an unmatched
+    /// field is a double charge.
+    fn params(edit: impl FnOnce(&mut SubmitJobParams)) -> SubmitJobParams {
+        let mut params = SubmitJobParams {
+            dataset: "GLBX.MDP3".to_owned(),
+            symbols: Symbols::Symbols(vec!["ESM4".to_owned()]),
+            schema: Schema::Trades,
+            date_time_range: DateTimeRange::from(
+                datetime!(2024-05-01 0:00 UTC)..datetime!(2024-05-02 0:00 UTC),
+            ),
+            encoding: Encoding::Dbn,
+            compression: Compression::Zstd,
+            pretty_px: false,
+            pretty_ts: false,
+            map_symbols: None,
+            split_symbols: false,
+            split_duration: SplitDuration::Day,
+            split_size: None,
+            delivery: Delivery::Download,
+            stype_in: SType::RawSymbol,
+            stype_out: SType::InstrumentId,
+            limit: None,
+        };
+        edit(&mut params);
+        params
+    }
+
+    /// The job the vendor would echo back for `params`, with its defaults resolved the
+    /// way the vendor resolves them.
+    fn job_from(params: &SubmitJobParams) -> BatchJob {
+        BatchJob {
+            id: "GLBX-20260813-TESTJOB".to_owned(),
+            user_id: None,
+            cost_usd: Some(0.0),
+            dataset: params.dataset.clone(),
+            symbols: params.symbols.clone(),
+            stype_in: params.stype_in,
+            stype_out: params.stype_out,
+            schema: params.schema,
+            start: params.date_time_range.start,
+            end: params.date_time_range.end,
+            limit: params.limit,
+            encoding: params.encoding,
+            compression: params.compression,
+            pretty_px: params.pretty_px,
+            pretty_ts: params.pretty_ts,
+            map_symbols: effective_map_symbols(params),
+            split_symbols: params.split_symbols,
+            split_duration: params.split_duration,
+            split_size: params.split_size,
+            delivery: params.delivery,
+            record_count: Some(1_000),
+            billed_size: Some(1_000),
+            actual_size: Some(1_000),
+            package_size: Some(1_000),
+            state: JobState::Done,
+            ts_received: datetime!(2024-05-02 1:00 UTC),
+            ts_queued: None,
+            ts_process_start: None,
+            ts_process_done: None,
+            ts_expiration: None,
+            progress: Some(100),
+        }
+    }
 
     #[test]
     fn symbol_sets_ignore_order_and_case() {
@@ -281,6 +411,79 @@ mod tests {
         assert!(same_symbols(&echoed, &requested));
         let other = Symbols::Symbols(vec!["CLZ4".to_owned()]);
         assert!(!same_symbols(&echoed, &other));
+    }
+
+    /// The match key is the only thing standing between a re-run and a second charge,
+    /// and the vendor is free to echo a deduplicated list back.
+    #[test]
+    fn repeated_symbols_are_one_selection() {
+        let requested = Symbols::Symbols(vec![
+            "ESM4".to_owned(),
+            "ESM4".to_owned(),
+            "NQM4".to_owned(),
+        ]);
+        let echoed = Symbols::Symbols(vec!["ESM4".to_owned(), "NQM4".to_owned()]);
+        assert!(same_symbols(&requested, &echoed));
+
+        let ids = Symbols::Ids(vec![42, 42, 7]);
+        assert!(same_symbols(&ids, &Symbols::Ids(vec![7, 42])));
+    }
+
+    #[test]
+    fn map_symbols_defaults_follow_the_encoding() {
+        let dbn = params(|_| {});
+        assert!(!effective_map_symbols(&dbn));
+
+        let csv = params(|p| p.encoding = Encoding::Csv);
+        assert!(effective_map_symbols(&csv));
+
+        let explicit = params(|p| {
+            p.encoding = Encoding::Csv;
+            p.map_symbols = Some(false);
+        });
+        assert!(!effective_map_symbols(&explicit));
+    }
+
+    /// Every field here changes the bytes the job delivers, so a job differing in any
+    /// one of them is not a substitute for the submission being matched.
+    #[test]
+    fn output_affecting_fields_prevent_a_match() {
+        let baseline = params(|_| {});
+        let job = job_from(&baseline);
+        assert!(job_matches(&job, &baseline));
+
+        let mut differs = job.clone();
+        differs.pretty_px = !job.pretty_px;
+        assert!(!job_matches(&differs, &baseline), "pretty_px");
+
+        let mut differs = job.clone();
+        differs.pretty_ts = !job.pretty_ts;
+        assert!(!job_matches(&differs, &baseline), "pretty_ts");
+
+        let mut differs = job.clone();
+        differs.map_symbols = !job.map_symbols;
+        assert!(!job_matches(&differs, &baseline), "map_symbols");
+
+        let mut differs = job.clone();
+        differs.split_size = NonZeroU64::new(2_000_000_000);
+        assert!(!job_matches(&differs, &baseline), "split_size");
+
+        let mut differs = job.clone();
+        differs.encoding = Encoding::Csv;
+        assert!(!job_matches(&differs, &baseline), "encoding");
+    }
+
+    /// A CSV job gets `map_symbols` by default, and the submission carries `None`. The
+    /// two have to compare equal or every CSV re-run buys the data again.
+    #[test]
+    fn a_csv_job_matches_its_own_defaults() {
+        let submitted = params(|p| p.encoding = Encoding::Csv);
+        let job = job_from(&submitted);
+        assert!(
+            job.map_symbols,
+            "the vendor applies the text-encoding default"
+        );
+        assert!(job_matches(&job, &submitted));
     }
 
     #[test]

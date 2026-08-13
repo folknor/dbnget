@@ -1,6 +1,6 @@
 //! `dbnget dataset` - everything about one dataset, and the dataset listing.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use databento::HistoricalClient;
 
 use crate::{Outcome, cli::DatasetArgs};
@@ -57,8 +57,11 @@ async fn publishers(client: &mut HistoricalClient, dataset: &str) -> Result<()> 
         .list_publishers()
         .await
         .context("listing publishers")?;
+
+    let mut shown = 0;
     for publisher in &publishers {
         if publisher.dataset.eq_ignore_ascii_case(dataset) {
+            shown += 1;
             println!(
                 "{id}\t{venue}\t{description}",
                 id = publisher.publisher_id,
@@ -66,6 +69,13 @@ async fn publishers(client: &mut HistoricalClient, dataset: &str) -> Result<()> 
                 description = publisher.description,
             );
         }
+    }
+
+    // Filtering a global list means a typo produces the same empty output a real
+    // dataset with no publishers would, and exits 0. Every real dataset has at least
+    // one publisher, so nothing matching means the code is wrong.
+    if shown == 0 {
+        bail!("no publishers for `{dataset}`; check the code against `dbnget list datasets`");
     }
     Ok(())
 }

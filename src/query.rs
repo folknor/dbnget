@@ -30,9 +30,14 @@ pub fn parse_date(raw: &str) -> Result<Date> {
 
 /// Resolves `--start` / `--end` into a half-open range.
 ///
-/// A bare `--start` date with no `--end` covers exactly that one UTC day, which is what
-/// a single-day pull almost always means. Both bounds are normalized to UTC instants so
-/// that a re-run keys to the same job the first run bought.
+/// An omitted `--end` always means exactly 24 hours after the start, whatever precision
+/// the start carried. For the plain `YYYY-MM-DD` start that is the one UTC day a
+/// single-day pull almost always means; for an RFC 3339 start it is the 24 hours
+/// following that instant, NOT the remainder of the calendar day. Pass `--end`
+/// explicitly for any other window.
+///
+/// Both bounds are normalized to UTC instants so that a re-run keys to the same job the
+/// first run bought.
 pub fn date_time_range(start: &str, end: Option<&str>) -> Result<DateTimeRange> {
     let start = parse_instant(start)?;
     let end = match end {

@@ -53,8 +53,8 @@ pub struct FetchArgs {
     #[arg(long)]
     pub start: Option<String>,
 
-    /// Exclusive end, as `YYYY-MM-DD` or an RFC 3339 timestamp. Defaults to one day
-    /// after `--start` when `--start` is a plain date.
+    /// Exclusive end, as `YYYY-MM-DD` or an RFC 3339 timestamp. Defaults to exactly 24
+    /// hours after `--start`, whether `--start` is a plain date or a timestamp.
     #[arg(long)]
     pub end: Option<String>,
 

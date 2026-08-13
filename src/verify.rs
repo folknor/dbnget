@@ -37,20 +37,35 @@ pub fn checked_file_name(filename: &str) -> Result<&str> {
     Ok(filename)
 }
 
-/// Verifies every file the job delivered, and returns their paths.
+/// Refuses a destination that already exists as a symbolic link.
 ///
-/// Fails on the first bad file rather than reporting at the end, so a corrupt download
-/// cannot be mistaken for a complete one by whatever runs next.
-pub async fn job_files(dir: &Path, files: &[BatchFileDesc]) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::with_capacity(files.len());
-    for file in files {
-        let name = checked_file_name(&file.filename)?;
-        let path = dir.join(name);
-        verify_file(&path, file).await?;
-        paths.push(path);
+/// Both the client's `File::create` and this module's own reads follow links, so a
+/// pre-created link at a name the manifest is about to claim would redirect the write,
+/// and the verification after it, outside the job directory. Checked before the write
+/// rather than after, because after is too late.
+///
+/// A missing path is fine - that is the ordinary case.
+pub fn no_symlink(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "refusing to write through the symbolic link at {}",
+            path.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("checking what sits at {}", path.display())),
     }
-    info!(count = paths.len(), dir = %dir.display(), "verified");
-    Ok(paths)
+}
+
+/// Verifies one delivered file: size, checksum, and - for a zstd file - that it starts
+/// with a zstd frame.
+///
+/// Fails loudly rather than reporting at the end, so a corrupt download cannot be
+/// mistaken for a complete one by whatever runs next.
+pub async fn file(path: &Path, desc: &BatchFileDesc) -> Result<PathBuf> {
+    verify_file(path, desc).await?;
+    info!(path = %path.display(), "verified");
+    Ok(path.to_path_buf())
 }
 
 /// Checks one file's size, checksum, and - for a zstd file - that it starts with a

@@ -20,10 +20,19 @@ account of what was actually bought. Re-running the same command is the poll loo
 - A matching job done: download into `OUT/JOB_ID/`, verify every file, exit 0.
 
 Matching is on the request itself - dataset, schema, symbols as a case-insensitive
-set, bounds, symbology, format. This is what makes a re-run adopt the existing job
-instead of buying the same data a second time, so ANY change to how a request is
-normalized into a match key is a change to whether users get double-charged. Bounds
-normalize to UTC instants for exactly this reason.
+deduplicated set, bounds, symbology, and EVERY output-affecting submission field
+(encoding, compression, split duration and size, `pretty_px`, `pretty_ts`,
+`map_symbols`, `split_symbols`, `delivery`, `limit`). This is what makes a re-run
+adopt the existing job instead of buying the same data a second time, so ANY change to
+how a request is normalized into a match key is a change to whether users get
+double-charged. Bounds normalize to UTC instants for exactly this reason.
+
+Two traps live here. `map_symbols` is an `Option<bool>` on the submission and a
+concrete `bool` on the echoed job, with an ENCODING-DEPENDENT default (true for CSV and
+JSON, false for DBN), so it must be resolved before comparing or every text-encoding
+re-run buys again. And a field ADDED to `SubmitJobParams` upstream that nobody adds to
+`job_matches` is a silent double charge - the test fixtures build both structs as
+literals precisely so that a new field fails the build.
 
 Exit code 3 is load-bearing, not decoration. A queued job is neither success nor
 failure, and giving it its own code is what lets a shell drive a wave of requests
@@ -39,7 +48,9 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   asked for is worse than stopping.
 - **A $0.00 quote is ambiguous and the record count disambiguates it.** It means
   either "covered by subscription" or "matches nothing". A zero-record request is an
-  error, not a free pass. Do not simplify this check away.
+  error, not a free pass. Do not simplify this check away. It applies on ADOPTION as
+  well as before a submit: an empty job already on the account is refused rather than
+  ignored, because ignoring it would fall through and submit a duplicate.
 - **dbnget is published on crates.io.** The spend gate protects arbitrary users with
   billable keys, not just this account. Hold it to that standard: never weaken, skip,
   or default-bypass it on the grounds that some particular key cannot be charged.
@@ -48,11 +59,25 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   size already matches without re-reading it. dbnget therefore re-checks size and
   SHA-256 against the job manifest after every download and fails on either. A
   corrupt file must not be mistakable for a complete one by whatever runs next.
-- **Manifest filenames are untrusted input.** They are joined onto the output
-  directory, so anything that is not a plain file name is rejected.
-- **Free space is checked before a download, not after.** A month of MBP-1 is tens of
-  gigabytes; running the filesystem dry leaves a partial file and takes the machine
-  down with it.
+- **Manifest filenames are untrusted input, and so is the job id.** Both are joined
+  onto the output directory, so anything that is not a plain file name is rejected.
+  Validation is only worth something if the VALIDATED name is the one written, which
+  is why files are downloaded one at a time by name: the client's download-all
+  re-fetches the manifest internally and derives its paths from that second response,
+  so a changed second response would reintroduce a path that was already checked.
+  Destinations are also refused when a symbolic link already sits there, checked
+  before the write rather than after.
+- **Free space is checked before EVERY file, counting that file's size.** A month of
+  MBP-1 is tens of gigabytes across many files; a floor-only check consulted once lets
+  a run start each file legally and still finish below the floor. Running the
+  filesystem dry leaves a partial file and takes the machine down with it.
+- **`--immediate` never overwrites and never leaves a partial file under the final
+  name.** The request is billed before a byte arrives, so truncating an existing
+  result destroys data that was paid for; and with no manifest to verify against, a
+  half-written file is indistinguishable from a complete one. An existing destination
+  is an error, and the stream lands on a `.part` sibling renamed only on success.
+  Filenames carry seconds and nanoseconds because minute precision let two
+  differently-priced requests collide.
 - **Databento does not fan out per symbol.** A multi-symbol batch submit stays ONE
   job, tested in both the API and the web UI. Code and docs must not assume
   per-symbol jobs.
