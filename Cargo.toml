@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.97"
 description = "Command-line downloader for Databento historical market data"
 license = "MIT"
+repository = "https://github.com/folknor/dbnget"
+readme = "README.md"
+keywords = ["databento", "market-data", "trading", "finance", "dbn"]
+categories = ["command-line-utilities", "finance"]
+exclude = ["/scratch", "/.reference", "databento.key", "*.key"]
 
 [dependencies]
 anyhow = "1"
