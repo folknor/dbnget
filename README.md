@@ -3,6 +3,8 @@
 A command-line downloader for [Databento](https://databento.com) historical market
 data, built on the official `databento` Rust client.
 
+Built with LLMs. See [LLM.md](LLM.md).
+
 ## Install
 
 ```sh

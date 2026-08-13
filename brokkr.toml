@@ -1,0 +1,24 @@
+project = "dbnget"
+
+# Without a [[check]] array brokkr falls back to its legacy default of ONE
+# --all-features sweep, which never compiles the crate as a CONSUMER gets it.
+# Anything that only breaks under DEFAULT features would pass `brokkr check` and
+# fail for a user. The default sweep is the load-bearing one.
+#
+# dbnget declares no optional features, so the default sweep covers every line
+# and no further sweeps are needed. IF A NON-DEFAULT FEATURE IS EVER ADDED TO
+# Cargo.toml, IT MUST GET A [[check]] HERE, otherwise it is silently unchecked
+# (`features = "all"` is rejected by brokkr on purpose).
+
+[[check]]
+name = "default"
+
+[test]
+debug = true
+
+# Single binary, `dbnget`, carried by the only package. PACKAGE name, not bin
+# name - they happen to coincide here.
+[bin]
+default = "dbnget"
+install = ["dbnget"]
+debug = true
