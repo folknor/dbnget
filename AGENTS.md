@@ -27,7 +27,20 @@ adopt the existing job instead of buying the same data a second time, so ANY cha
 how a request is normalized into a match key is a change to whether users get
 double-charged. Bounds normalize to UTC instants for exactly this reason.
 
-Two traps live here. `map_symbols` is an `Option<bool>` on the submission and a
+`ALL_SYMBOLS` is the trap with the largest bill attached. The vendor echoes symbols as
+a JSON array, and the client maps only a SCALAR `"ALL_SYMBOLS"` string to
+`Symbols::All`, so a whole-dataset job comes back as an ordinary one-element list.
+Comparing the enum variants directly never matched, and the request it failed to match
+is the most expensive one an account can make. Both forms canonicalize to the sentinel.
+
+The job listing is fetched with an EXPLICIT state filter, never an omitted one. An
+omitted filter means "all except expired" server-side, which made the expired
+re-purchase warning unreachable, and it admits states this client's `JobState` cannot
+deserialize - `received`, which a job passes through before it is queued - failing the
+entire listing and every command with it. The price of naming the states is that a job
+still in `received` is invisible, so the documented submit-to-listing window covers it.
+
+Two more traps live here. `map_symbols` is an `Option<bool>` on the submission and a
 concrete `bool` on the echoed job, with an ENCODING-DEPENDENT default (true for CSV and
 JSON, false for DBN), so it must be resolved before comparing or every text-encoding
 re-run buys again. And a field ADDED to `SubmitJobParams` upstream that nobody adds to

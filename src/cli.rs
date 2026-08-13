@@ -117,6 +117,26 @@ pub struct FetchArgs {
     pub cost: bool,
 }
 
+impl FetchArgs {
+    /// Whether the user asked for nothing at all.
+    ///
+    /// `dbnget` on its own is someone finding out what the tool is, and answering that
+    /// with `--dataset is required` teaches them nothing. Only the request-defining
+    /// arguments count: a bare invocation that still carries `--key` or `-v` is the
+    /// same question.
+    pub fn is_bare(&self) -> bool {
+        self.symbols.is_empty()
+            && self.dataset.is_none()
+            && self.schema.is_none()
+            && self.start.is_none()
+            && self.end.is_none()
+            && self.limit.is_none()
+            && !self.immediate
+            && !self.cost
+            && self.spend.is_none()
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct ListArgs {
     /// What to list.

@@ -55,7 +55,8 @@ to change by accident: adding it to a command that already bought the unlimited 
 buys the data again.
 
 The one gap is the window between the submit POST being charged and the job appearing
-in the listing: a process that dies in it can submit twice on re-run.
+in the listing as something dbnget can read: a process that dies in it, or a re-run
+inside it, can submit twice. It is bounded by seconds.
 
 ### Symbology: `--stype-in` and `--stype-out`
 
@@ -169,14 +170,22 @@ well, so when it cannot answer, the line is simply absent and the quote stands.
 One plain streaming request, written straight to disk as
 `DATASET.SCHEMA.START-END.dbn.zst`, where the bounds carry seconds (and nanoseconds
 when they have them) so two requests that differ below the minute cannot land on one
-name. DBN only - the streaming API does not deliver CSV or JSON. The spend gate applies
-exactly as above; streaming bills the moment the request is issued.
+name. DBN only - the streaming API does not deliver CSV or JSON. Streaming bills the
+moment the request is issued.
+
+**The spend gate is weaker here.** The cost endpoint prices the batch feed mode and
+takes no parameter to ask about another, so the quote `--spend` is checked against is a
+floor, not the bill: streaming is a dearer feed mode and the actual charge is higher.
+dbnget says so on every `--immediate` run. Treat `--spend` as an approximate ceiling on
+this path and an exact one on the batch path.
 
 Because the request is already billed by the time a byte arrives, an existing file at
-that name is an error rather than something to overwrite, and the stream lands on a
-`.part` sibling that is renamed only once it completes - there is no manifest to verify
-an immediate download against, so a half-written file must never be left under the
-final name.
+that name is an error rather than something to overwrite. Both the destination and its
+`.part` sibling are claimed exclusively before the request is priced or issued, so two
+concurrent runs of the same command cannot both pay, and a filesystem problem surfaces
+while the request is still free. The stream lands on the `.part` sibling and is renamed
+only once it completes - there is no manifest to verify an immediate download against,
+so a half-written file must never be left under the final name.
 
 There is no session splitting, resume, or empty-day pre-pass here. That machinery
 existed when streaming was the primary path; with batch as the default, the vendor

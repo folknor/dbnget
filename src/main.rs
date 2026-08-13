@@ -9,7 +9,7 @@ mod verify;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use databento::HistoricalClient;
 use tracing_subscriber::EnvFilter;
 
@@ -52,6 +52,13 @@ async fn main() -> ExitCode {
 async fn run() -> Result<Outcome> {
     let args = Cli::parse();
     init_tracing(args.verbose);
+
+    // Answer "what is this" with the help, not with a complaint about a missing flag,
+    // and before demanding an API key the user has no reason to have set yet.
+    if args.command.is_none() && args.fetch.is_bare() {
+        Cli::command().print_help().context("printing help")?;
+        return Ok(Outcome::Settled);
+    }
 
     let mut client = build_client(args.key.as_deref())?;
     match &args.command {
@@ -104,8 +111,12 @@ fn resolve_key(raw: &str) -> Result<String> {
     if raw.starts_with("db-") {
         return Ok(raw.to_owned());
     }
+    // The value is never echoed. Anything that reaches here is either a path or a
+    // mistyped key, and a mistyped key is still a key: printing it puts a credential
+    // into a terminal, a log, or a CI transcript, which is exactly how they escape.
     let contents = std::fs::read_to_string(raw).with_context(|| {
-        format!("`{raw}` does not start with `db-`, and reading it as a key file failed")
+        "the value does not start with `db-`, and reading it as a path to a key file failed"
+            .to_owned()
     })?;
     let key = contents.trim();
     if !key.starts_with("db-") {

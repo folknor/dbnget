@@ -130,8 +130,11 @@ async fn verify_file(path: &Path, desc: &BatchFileDesc) -> Result<()> {
         bail!("{}: unsupported hash algorithm `{algo}`", path.display());
     }
 
+    // Compared case-insensitively: hex is hex whichever case the vendor sends it in,
+    // and treating an uppercase digest as a mismatch would condemn a perfectly good
+    // file to be deleted and re-fetched on every run, forever.
     let actual = sha256_file(path).await?;
-    if actual != expected {
+    if !actual.eq_ignore_ascii_case(expected) {
         bail!(
             "{}: checksum mismatch (manifest {expected}, on disk {actual})",
             path.display()

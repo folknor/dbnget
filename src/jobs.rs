@@ -18,9 +18,12 @@ use crate::{Outcome, cli::ListArgs, query, verify};
 /// and this is the user's tool for checking it before submitting.
 pub async fn list(client: &mut HistoricalClient, args: &ListArgs) -> Result<Outcome> {
     let states = if args.state.is_empty() {
-        None
+        // Naming every state, rather than omitting the filter, for the reasons on
+        // `LISTED_STATES`: an omitted filter hides expired jobs and admits states this
+        // client cannot deserialize.
+        LISTED_STATES.to_vec()
     } else {
-        Some(args.state.iter().copied().map(JobState::from).collect())
+        args.state.iter().copied().map(JobState::from).collect()
     };
     let since = args
         .since
@@ -28,7 +31,7 @@ pub async fn list(client: &mut HistoricalClient, args: &ListArgs) -> Result<Outc
         .map(query::parse_instant)
         .transpose()?;
     let params = ListJobsParams::builder()
-        .maybe_states(states)
+        .states(states)
         .maybe_since(since)
         .build();
 
@@ -46,10 +49,33 @@ pub async fn list(client: &mut HistoricalClient, args: &ListArgs) -> Result<Outc
     Ok(Outcome::Settled)
 }
 
-/// Fetches every job on the account, in every state. Expired jobs are included so the
-/// caller can warn that a re-submit is a re-purchase.
+/// Every state the client can represent. Naming them is not the same as omitting the
+/// filter, and the difference bites twice.
+///
+/// An omitted filter means "all except expired" server-side, so `find_expired` could
+/// never find anything and the re-purchase warning was unreachable. And the vendor has
+/// at least one state this client's enum cannot represent - a job sits in `received`
+/// before it is queued - which an omitted filter would include and the client's
+/// deserializer rejects outright, failing the whole listing and taking every command
+/// with it.
+///
+/// The cost of naming them is that a job still in `received` is invisible here, so a
+/// re-run inside that window submits again. That is the same submit-to-listing window
+/// the README already discloses, and it is bounded by seconds; a listing that cannot be
+/// parsed at all is not.
+const LISTED_STATES: [JobState; 4] = [
+    JobState::Queued,
+    JobState::Processing,
+    JobState::Done,
+    JobState::Expired,
+];
+
+/// Fetches every job on the account, in every state this client understands. Expired
+/// jobs are included so the caller can warn that a re-submit is a re-purchase.
 pub async fn all(client: &mut HistoricalClient) -> Result<Vec<BatchJob>> {
-    let params = ListJobsParams::builder().build();
+    let params = ListJobsParams::builder()
+        .states(LISTED_STATES.to_vec())
+        .build();
     client
         .batch()
         .list_jobs(&params)
@@ -139,32 +165,41 @@ fn same_instant(left: OffsetDateTime, right: OffsetDateTime) -> bool {
 /// `ESM4 NQM4` selects, and the vendor is free to echo back either form; leaving the
 /// repeat in would fail the match and re-buy data the account already owns.
 fn same_symbols(left: &Symbols, right: &Symbols) -> bool {
-    fn normalize(list: &[String]) -> Vec<String> {
-        let mut out: Vec<String> = list
-            .iter()
-            .flat_map(|s| s.split(','))
-            .map(|s| s.trim().to_uppercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
+    /// The sentinel meaning "every symbol in the dataset".
+    const ALL: &str = "ALL_SYMBOLS";
+
+    /// One selection reduced to a comparable form.
+    ///
+    /// `Symbols::All` becomes the sentinel spelled out, because that is how it comes
+    /// back. The vendor echoes symbols as a JSON array, and the client only maps a
+    /// SCALAR `"ALL_SYMBOLS"` string to `Symbols::All` - an array containing it
+    /// deserializes as an ordinary one-element list. Comparing the variants directly
+    /// therefore never matched a whole-dataset job against the request that bought it,
+    /// which is the single most expensive thing this function could get wrong.
+    fn canonical(symbols: &Symbols) -> Result<Vec<String>, Vec<u32>> {
+        match symbols {
+            Symbols::All => Ok(vec![ALL.to_owned()]),
+            Symbols::Symbols(list) => {
+                let mut out: Vec<String> = list
+                    .iter()
+                    .flat_map(|s| s.split(','))
+                    .map(|s| s.trim().to_uppercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                out.sort_unstable();
+                out.dedup();
+                Ok(out)
+            }
+            Symbols::Ids(list) => {
+                let mut out = list.clone();
+                out.sort_unstable();
+                out.dedup();
+                Err(out)
+            }
+        }
     }
 
-    match (left, right) {
-        (Symbols::All, Symbols::All) => true,
-        (Symbols::Symbols(left), Symbols::Symbols(right)) => normalize(left) == normalize(right),
-        (Symbols::Ids(left), Symbols::Ids(right)) => {
-            let mut left = left.clone();
-            let mut right = right.clone();
-            left.sort_unstable();
-            right.sort_unstable();
-            left.dedup();
-            right.dedup();
-            left == right
-        }
-        _ => false,
-    }
+    canonical(left) == canonical(right)
 }
 
 /// Downloads a finished job into `out/JOB_ID/` and verifies every file against the
@@ -504,6 +539,25 @@ mod tests {
             "the vendor applies the text-encoding default"
         );
         assert!(job_matches(&job, &submitted));
+    }
+
+    /// The vendor echoes symbols as an array, and an array holding the sentinel
+    /// deserializes as an ordinary one-element list rather than as `Symbols::All`. A
+    /// whole-dataset job is the most expensive thing on an account, so this is the
+    /// worst possible place for a mismatch.
+    #[test]
+    fn all_symbols_matches_however_it_is_spelled() {
+        let echoed = Symbols::Symbols(vec!["ALL_SYMBOLS".to_owned()]);
+        assert!(same_symbols(&Symbols::All, &echoed));
+        assert!(same_symbols(&echoed, &Symbols::All));
+        assert!(same_symbols(&Symbols::All, &Symbols::All));
+
+        let lowercase = Symbols::Symbols(vec!["all_symbols".to_owned()]);
+        assert!(same_symbols(&Symbols::All, &lowercase));
+
+        // Still not the same as naming one instrument.
+        let one = Symbols::Symbols(vec!["ESM4".to_owned()]);
+        assert!(!same_symbols(&Symbols::All, &one));
     }
 
     #[test]

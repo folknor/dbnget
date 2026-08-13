@@ -258,6 +258,16 @@ async fn immediate(
     let quote = spend::fetch(client, &request.metadata_params()).await?;
     spend::approve(&quote, args.spend)?;
 
+    // The cost endpoint prices the default feed mode, which is the batch one, and it
+    // takes no mode parameter to ask otherwise. Streaming is a different, dearer feed
+    // mode, so this quote is a floor rather than the bill. Said out loud because the
+    // gate's whole promise is that nothing is charged beyond what was approved, and on
+    // this path that promise is weaker than on the batch path.
+    warn!(
+        quoted = format!("${:.2}", quote.usd),
+        "--immediate is gated on the batch price; streaming is billed at the streaming rate, which is higher"
+    );
+
     info!(path = %path.display(), "streaming");
     let params = GetRangeParams::builder()
         .dataset(&request.dataset)
