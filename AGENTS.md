@@ -72,13 +72,30 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   ENOSPC and report the error. A `--min-free-gb` flag existed and was removed: it
   reimplemented a check the kernel already performs, turned a full disk into an exit
   code indistinguishable from a real failure, and shipped enabled by default.
-- **`--immediate` never overwrites and never leaves a partial file under the final
-  name.** The request is billed before a byte arrives, so truncating an existing
+- **`--immediate` claims both output names, exclusively, before the request is priced
+  or issued.** The request is billed before a byte arrives, so truncating an existing
   result destroys data that was paid for; and with no manifest to verify against, a
-  half-written file is indistinguishable from a complete one. An existing destination
-  is an error, and the stream lands on a `.part` sibling renamed only on success.
-  Filenames carry seconds and nanoseconds because minute precision let two
-  differently-priced requests collide.
+  half-written file is indistinguishable from a complete one. Asking whether a file
+  exists and then writing it is a race two concurrent runs both win, and treating an
+  I/O error as "does not exist" turns a permissions problem into a charge. So both the
+  destination and its `.part` sibling are created with an exclusive create up front,
+  the final rename only ever replaces this run's own placeholder, and a failed request
+  releases the claims so a retry is possible. Filenames carry seconds and nanoseconds
+  because minute precision let two differently-priced requests collide.
+- **A corrupt batch file is removed before the client is asked for it again.** The
+  client skips any file whose size already matches the manifest, without reading it, so
+  a same-size corrupt file would otherwise fail verification on every retry forever
+  with no recovery but deleting it by hand - for data already paid for. An existing
+  file that verifies is kept and not re-fetched; one that does not is discarded first.
+- **Filename validation is the union of platform rules, not the running platform's.**
+  The crate is not declared Unix-only. Colons, the Windows-illegal punctuation, control
+  characters, trailing dots and spaces, and reserved device names like `CON` and `NUL`
+  are all refused, on top of the separator and parent-directory checks. These names are
+  vendor job ids and generated data filenames, so a refusal means something upstream is
+  wrong.
+- **The spend gate fails closed on any quote it cannot account for.** Non-finite and
+  negative both. A negative quote is not a discount, and it would pass every
+  non-negative cap including the $0.00 default.
 - **Databento does not fan out per symbol.** A multi-symbol batch submit stays ONE
   job, tested in both the API and the web UI. Code and docs must not assume
   per-symbol jobs.

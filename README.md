@@ -43,12 +43,19 @@ reconciles the request against the account:
   exit 0.
 
 Re-running the same command *is* the poll loop. Matching is on the request itself -
-dataset, schema, symbols as a case-insensitive set, bounds, symbology, format -
-because the vendor's job listing is the only account of what was actually bought.
-There is no local ledger; a re-run of a command whose first attempt succeeded adopts
-the existing job instead of buying the same data twice. The one gap is the window
-between the submit POST being charged and the job appearing in the listing: a process
-that dies in it can submit twice on re-run.
+dataset, schema, symbols as a case-insensitive set with repeats collapsed, bounds,
+both symbologies, format, `--limit`, and every remaining field that affects the
+delivered bytes - because the vendor's job listing is the only account of what was
+actually bought. There is no local ledger; a re-run of a command whose first attempt
+succeeded adopts the existing job instead of buying the same data twice.
+
+Anything in that list is part of the request's identity, so changing it makes a
+different job rather than the same one spelled differently. `--limit` is the easiest one
+to change by accident: adding it to a command that already bought the unlimited form
+buys the data again.
+
+The one gap is the window between the submit POST being charged and the job appearing
+in the listing: a process that dies in it can submit twice on re-run.
 
 ### Symbology: `--stype-in` and `--stype-out`
 

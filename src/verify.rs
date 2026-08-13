@@ -21,20 +21,56 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 /// down on the multi-gigabyte files a month of MBP-1 produces.
 const READ_BUFFER: usize = 1 << 23;
 
-/// Rejects a manifest entry whose filename is anything other than a plain file name.
+/// Names Windows refuses regardless of extension, as a device rather than a file.
+const RESERVED: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Rejects a name that is anything other than a plain, portable file name.
 ///
-/// The name is joined onto the output directory, so a name containing a separator or a
-/// parent-directory component would write outside it.
+/// These names come off the wire and are joined onto the output directory, so a
+/// separator or a parent-directory component would write outside it. The rules are the
+/// union across platforms, not the rules of whatever is running: this crate is not
+/// declared Unix-only, and a name that is merely awkward on Linux can be unwritable on
+/// Windows - a colon makes an alternate data stream, a trailing dot or space is
+/// silently trimmed into a different name, and `CON` or `NUL` is a device.
+///
+/// Being stricter than the running platform costs nothing here. The names are vendor
+/// job ids and generated data filenames, none of which have any business containing
+/// these characters, so a refusal means something has gone wrong upstream.
 pub fn checked_file_name(filename: &str) -> Result<&str> {
-    if filename.is_empty()
-        || filename.contains('/')
-        || filename.contains('\\')
-        || filename == "."
-        || filename == ".."
-    {
-        bail!("refusing manifest filename `{filename}`: not a plain file name");
+    let refuse =
+        |why: &str| -> anyhow::Error { anyhow::anyhow!("refusing filename `{filename}`: {why}") };
+
+    if filename.is_empty() {
+        return Err(refuse("empty"));
     }
-    Ok(filename)
+    if filename == "." || filename == ".." {
+        return Err(refuse("a directory reference, not a file"));
+    }
+    if let Some(bad) = filename.chars().find(|c| {
+        matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*') || c.is_control()
+    }) {
+        return Err(refuse(&format!("contains `{}`", bad.escape_default())));
+    }
+    if filename.ends_with('.') || filename.ends_with(' ') {
+        return Err(refuse("ends with a dot or a space"));
+    }
+
+    // The stem is what Windows matches against, so `NUL.txt` is as refused as `NUL`.
+    let stem = filename.split('.').next().unwrap_or(filename);
+    if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
+        return Err(refuse("a reserved device name"));
+    }
+
+    // Belt and braces: whatever the string looked like, it has to be exactly one
+    // ordinary path component to the platform actually running.
+    let mut components = Path::new(filename).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(one)), None) if one == filename => Ok(filename),
+        _ => Err(refuse("not a single plain path component")),
+    }
 }
 
 /// Refuses a destination that already exists as a symbolic link.
@@ -187,6 +223,49 @@ mod tests {
             assert!(
                 checked_file_name(bad).is_err(),
                 "should have refused `{bad}`"
+            );
+        }
+    }
+
+    /// Refused everywhere, not just where they happen to be illegal. These names are
+    /// writable on Linux and are not on Windows, and the crate does not claim to be
+    /// Unix-only.
+    #[test]
+    fn names_windows_cannot_write_are_refused() {
+        for bad in [
+            "C:evil",
+            "stream:name",
+            "trailing.",
+            "trailing ",
+            "CON",
+            "nul.txt",
+            "COM1",
+            "what?",
+            "star*",
+            "pipe|name",
+            "quote\"name",
+            "less<than",
+            "bell\u{7}",
+        ] {
+            assert!(
+                checked_file_name(bad).is_err(),
+                "should have refused `{bad}`"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_vendor_names_still_pass() {
+        for good in [
+            "glbx-mdp3-20240501.trades.csv.zst",
+            "GLBX-20260813-K8LCTCLNJJ",
+            "manifest.json",
+            "condition.json",
+            ".hidden",
+        ] {
+            assert!(
+                checked_file_name(good).is_ok(),
+                "should have accepted `{good}`"
             );
         }
     }

@@ -73,9 +73,12 @@ pub fn approve(quote: &Quote, spend: Option<f64>) -> Result<()> {
     if quote.is_empty() {
         bail!("this request matches no records - check the symbols, dataset and date range");
     }
-    if !quote.usd.is_finite() {
+    // A negative price is not a discount, it is a response nobody designed. The gate
+    // fails closed on financial values it cannot account for, and a negative quote
+    // would otherwise slip under every non-negative cap, including the $0.00 default.
+    if !quote.usd.is_finite() || quote.usd < 0.0 {
         bail!(
-            "the quoted cost is not a finite number ({}) - refusing",
+            "the quoted cost is not a sensible amount ({}) - refusing",
             quote.usd
         );
     }
@@ -137,6 +140,10 @@ mod tests {
         assert!(approve(&quote(f64::INFINITY, 100), Some(10.0)).is_err());
         assert!(approve(&quote(1.0, 100), Some(f64::NAN)).is_err());
         assert!(approve(&quote(1.0, 100), Some(f64::INFINITY)).is_err());
+        // A negative quote would otherwise pass every non-negative cap, the $0.00
+        // default included.
+        assert!(approve(&quote(-1.0, 100), None).is_err());
+        assert!(approve(&quote(-1.0, 100), Some(10.0)).is_err());
     }
 
     #[test]

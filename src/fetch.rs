@@ -6,7 +6,7 @@
 //! missing one is queued - subject to the spend gate. Re-running the same command is
 //! the poll loop.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use databento::{
@@ -235,31 +235,28 @@ async fn immediate(
         bail!("--immediate delivers DBN only; drop --format or use the batch path");
     }
 
-    let quote = spend::fetch(client, &request.metadata_params()).await?;
-    spend::approve(&quote, args.spend)?;
-
     tokio::fs::create_dir_all(&args.output)
         .await
         .with_context(|| format!("creating output directory {}", args.output.display()))?;
     let path = args.output.join(request.file_name()?);
-
-    // This request has already been billed by the time a byte arrives, so silently
-    // truncating an existing result would destroy data the account paid for twice: once
-    // for the file being overwritten, once for the one overwriting it.
-    verify::no_symlink(&path)?;
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        bail!(
-            "{} already exists; move it aside or choose another --output rather than paying for it again",
-            path.display()
-        );
-    }
-
-    // Stream to a sibling and rename on success. A stream killed part way through
-    // otherwise leaves a short file under the final name, and nothing downstream can
-    // tell it from a complete one - there is no manifest to verify an immediate
-    // download against.
     let partial = path.with_extension("part");
-    verify::no_symlink(&partial)?;
+
+    // Both names are claimed BEFORE the request is priced or issued, and claimed by
+    // creating them exclusively rather than by asking whether they exist. A check
+    // followed by a write is a race: two runs of the same command both see nothing
+    // there, both pay, both stream into one partial file, and the loser's data is
+    // replaced by the winner's. An exclusive create is the only form of this that two
+    // processes cannot both win.
+    //
+    // Doing it before `spend::fetch` matters as much as doing it exclusively. Every
+    // failure reachable here - the file exists, the directory is unwritable, a path
+    // component is inaccessible - is a failure that must happen while the request is
+    // still free.
+    let _claim = claim(&path)?;
+    let _partial_claim = claim(&partial)?;
+
+    let quote = spend::fetch(client, &request.metadata_params()).await?;
+    spend::approve(&quote, args.spend)?;
 
     info!(path = %path.display(), "streaming");
     let params = GetRangeParams::builder()
@@ -271,19 +268,56 @@ async fn immediate(
         .stype_out(request.stype_out)
         .maybe_limit(request.limit)
         .build();
-    let decoder = client
+    let outcome = client
         .timeseries()
         .get_range_to_file(&params.with_path(&partial))
-        .await
-        .with_context(|| format!("downloading {}", partial.display()))?;
-    drop(decoder);
+        .await;
 
+    if let Err(err) = outcome {
+        // The claims are this run's own, and the request failed, so releasing them lets
+        // a retry proceed. Leaving them would turn one network error into a permanently
+        // blocked command.
+        release(&partial).await;
+        release(&path).await;
+        return Err(err).with_context(|| format!("downloading {}", partial.display()));
+    }
+
+    // Replaces this run's own placeholder, which is what makes the rename safe: no
+    // other process could have claimed that name, so nothing else can be under it.
     tokio::fs::rename(&partial, &path)
         .await
         .with_context(|| format!("renaming {} to {}", partial.display(), path.display()))?;
 
     println!("{}", path.display());
     Ok(Outcome::Settled)
+}
+
+/// Claims an output name by creating it exclusively.
+///
+/// Returns the handle so the caller holds the claim for as long as it needs it. The
+/// error distinguishes the ordinary case - the file is already there - from a genuine
+/// filesystem problem, because the two call for different things from the user, and
+/// because treating the second as "does not exist" is how a permission error turns into
+/// a charge for data that cannot be written.
+fn claim(path: &Path) -> Result<std::fs::File> {
+    verify::no_symlink(path)?;
+    std::fs::File::create_new(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "{} already exists; move it aside or choose another --output rather than paying for it again",
+                path.display()
+            )
+        } else {
+            anyhow::Error::new(err).context(format!("claiming {}", path.display()))
+        }
+    })
+}
+
+/// Drops a claim this run made and could not use.
+async fn release(path: &Path) {
+    if let Err(err) = tokio::fs::remove_file(path).await {
+        warn!(path = %path.display(), %err, "could not clean up after a failed download");
+    }
 }
 
 impl Request {

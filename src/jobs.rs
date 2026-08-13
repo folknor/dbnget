@@ -10,6 +10,7 @@ use databento::{
     historical::batch::{BatchJob, DownloadParams, JobState, ListJobsParams, SubmitJobParams},
 };
 use time::OffsetDateTime;
+use tracing::warn;
 
 use crate::{Outcome, cli::ListArgs, query, verify};
 
@@ -205,6 +206,34 @@ pub async fn download(client: &mut HistoricalClient, job_id: &str, out: &Path) -
         let name = verify::checked_file_name(&desc.filename)?;
         let path = job_dir.join(name);
         verify::no_symlink(&path)?;
+
+        // An already-good file is done: say so and move on without asking the vendor
+        // for bytes the disk already holds.
+        //
+        // A file that is present and BAD has to be removed before the client is asked
+        // for it, because the client skips any file whose size already matches the
+        // manifest without reading or re-fetching it. A corrupt file of the right
+        // length therefore survives every retry: dbnget rejects it, the next run asks
+        // for it again, the client declines to fetch it, and the same failure repeats
+        // forever with no way out but deleting the file by hand - for data that has
+        // already been paid for.
+        if tokio::fs::try_exists(&path)
+            .await
+            .with_context(|| format!("checking for {}", path.display()))?
+        {
+            match verify::file(&path, desc).await {
+                Ok(path) => {
+                    paths.push(path);
+                    continue;
+                }
+                Err(err) => {
+                    warn!(path = %path.display(), %err, "discarding a bad file and fetching it again");
+                    tokio::fs::remove_file(&path)
+                        .await
+                        .with_context(|| format!("removing the corrupt {}", path.display()))?;
+                }
+            }
+        }
 
         let params = DownloadParams::builder()
             .output_dir(out)
