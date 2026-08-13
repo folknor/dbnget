@@ -3,6 +3,9 @@ mod cli;
 mod get;
 mod meta;
 mod query;
+mod session;
+mod spend;
+mod verify;
 
 use anyhow::{Context, Result};
 use clap::Parser;

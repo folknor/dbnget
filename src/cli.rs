@@ -3,6 +3,8 @@ use std::{num::NonZeroU64, path::PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use databento::dbn::{SType, Schema};
 
+use crate::session::SessionArg;
+
 /// Command-line downloader for Databento historical market data.
 #[derive(Debug, Parser)]
 #[command(name = "dbnget", version, about, long_about = None)]
@@ -79,10 +81,22 @@ pub struct GetArgs {
     #[arg(short, long, default_value = ".")]
     pub out: PathBuf,
 
-    /// Split the range into one request and one file per UTC day, so an
-    /// interrupted download resumes at the first missing day.
+    /// Issue one request, and write one file, per trading session. An interrupted
+    /// download then resumes at the first missing session.
     #[arg(long)]
-    pub daily: bool,
+    pub split: bool,
+
+    /// The trading-session convention used by `--split`. `auto` derives it from the
+    /// dataset: CME datasets run 17:00 to 16:00 America/Chicago, everything else uses
+    /// UTC calendar days.
+    #[arg(long, default_value = "auto")]
+    pub session: SessionArg,
+
+    /// Before downloading each chunk, ask the unbilled record-count endpoint whether it
+    /// holds anything, and skip it if not. Costs one metadata call per chunk and skips
+    /// weekends, holidays and closures without a holiday calendar.
+    #[arg(long)]
+    pub skip_empty: bool,
 
     /// Re-download files that already exist instead of skipping them.
     #[arg(long)]
@@ -140,6 +154,15 @@ pub struct BatchSubmitArgs {
     /// Seconds between polls while waiting for a job.
     #[arg(long, default_value_t = 15, value_name = "SECS")]
     pub poll_interval: u64,
+
+    /// Actually submit the job. Without this the command prices the request and stops.
+    #[arg(long)]
+    pub confirm: bool,
+
+    /// The most this submission may cost, in US dollars. Required by `--confirm`; a
+    /// quote above the cap refuses rather than truncating the request.
+    #[arg(long, value_name = "USD", requires = "confirm")]
+    pub max_dollars: Option<f64>,
 }
 
 #[derive(Debug, Args)]

@@ -5,29 +5,30 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use databento::{
     HistoricalClient,
-    historical::{DateTimeRange, timeseries::GetRangeParams},
+    historical::{DateTimeRange, metadata::GetRecordCountParams, timeseries::GetRangeParams},
 };
-use time::{Date, Duration, OffsetDateTime};
+use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 use tracing::info;
 
-use crate::{cli::GetArgs, query};
+use crate::{cli::GetArgs, query, session};
 
-/// Runs the `get` command, writing one file per day when `--daily` is set and a single
-/// file for the whole range otherwise.
+/// The stamp format for file names: sortable, and free of separators that would
+/// collide with the dotted fields around it.
+const STAMP: &[FormatItem<'_>] = format_description!("[year][month][day]T[hour][minute]");
+
+/// Runs the `get` command: one request and one file per session when `--split` is set,
+/// a single request for the whole range otherwise.
 pub async fn run(client: &mut HistoricalClient, args: &GetArgs) -> Result<()> {
     tokio::fs::create_dir_all(&args.out)
         .await
         .with_context(|| format!("creating output directory {}", args.out.display()))?;
 
     let base = query::range_params(&args.query)?;
-    let chunks = if args.daily {
-        daily_chunks(&base.date_time_range)
-    } else {
-        vec![base.date_time_range.clone()]
-    };
+    let chunks = plan_chunks(args, &base)?;
 
     let mut written = 0usize;
     let mut skipped = 0usize;
+    let mut empty = 0usize;
     for chunk in chunks {
         let path = args.out.join(file_name(&base, &chunk));
         if !args.force && is_already_downloaded(&path).await {
@@ -35,12 +36,54 @@ pub async fn run(client: &mut HistoricalClient, args: &GetArgs) -> Result<()> {
             skipped += 1;
             continue;
         }
+        if args.skip_empty && is_empty(client, &base, &chunk).await? {
+            info!(path = %path.display(), "no records in range, skipping");
+            empty += 1;
+            continue;
+        }
         download_chunk(client, &base, chunk, &path).await?;
         written += 1;
     }
 
-    info!(written, skipped, "download complete");
+    info!(written, skipped, empty, "download complete");
     Ok(())
+}
+
+/// Splits the request into the chunks that will each become one file.
+fn plan_chunks(args: &GetArgs, base: &GetRangeParams) -> Result<Vec<DateTimeRange>> {
+    if !args.split {
+        return Ok(vec![base.date_time_range.clone()]);
+    }
+    let convention = args.session.resolve(&base.dataset);
+    info!(?convention, "splitting range by session");
+    session::split(&base.date_time_range, convention)
+}
+
+/// Asks the (unbilled) record-count endpoint whether a chunk would return anything.
+///
+/// Weekends, holidays and half-sessions fall out of this without a holiday table: a
+/// closure returns zero for the exact query about to be issued. Note that
+/// `metadata.get_dataset_condition` cannot be used for this - it reports dataset
+/// ingestion status and answers "available" for Christmas Day and every Saturday.
+async fn is_empty(
+    client: &mut HistoricalClient,
+    base: &GetRangeParams,
+    range: &DateTimeRange,
+) -> Result<bool> {
+    let params = GetRecordCountParams::builder()
+        .dataset(&base.dataset)
+        .symbols(base.symbols.clone())
+        .schema(base.schema)
+        .date_time_range(range.clone())
+        .stype_in(base.stype_in)
+        .maybe_limit(base.limit)
+        .build();
+    let count = client
+        .metadata()
+        .get_record_count(&params)
+        .await
+        .context("fetching record count")?;
+    Ok(count == 0)
 }
 
 /// Fetches one range into `path`, via a temporary file so an interrupted run never
@@ -77,48 +120,21 @@ async fn is_already_downloaded(path: &Path) -> bool {
     }
 }
 
-/// Splits a range into half-open one-UTC-day chunks, clamping the last chunk to `end`.
-fn daily_chunks(range: &DateTimeRange) -> Vec<DateTimeRange> {
-    let mut chunks = Vec::new();
-    let mut cursor = range.start;
-    while cursor < range.end {
-        let next = midnight_after(cursor).min(range.end);
-        chunks.push(DateTimeRange::from(cursor..next));
-        cursor = next;
-    }
-    chunks
-}
-
-/// The first UTC midnight strictly after `instant`.
-fn midnight_after(instant: OffsetDateTime) -> OffsetDateTime {
-    (instant.date() + Duration::days(1)).midnight().assume_utc()
-}
-
 /// Names a file after the query it holds, so a directory of them stays self-describing.
+///
+/// Both bounds are always present: under a session convention a chunk is not a calendar
+/// day, and a name that implied otherwise would be a lie about what is in the file.
 fn file_name(base: &GetRangeParams, range: &DateTimeRange) -> PathBuf {
     let dataset = base.dataset.replace('.', "_");
-    let stamp = stamp(range);
-    PathBuf::from(format!("{dataset}.{}.{stamp}.dbn.zst", base.schema))
+    let start = stamp(range.start);
+    let end = stamp(range.end);
+    PathBuf::from(format!("{dataset}.{}.{start}-{end}.dbn.zst", base.schema))
 }
 
-/// A compact, sortable label for a range: the date alone when the range is a whole UTC
-/// day, otherwise both endpoints.
-fn stamp(range: &DateTimeRange) -> String {
-    let start = format_date(range.start.date());
-    if is_whole_day(range) {
-        return start;
-    }
-    format!("{start}_{}", format_date(range.end.date()))
-}
-
-fn is_whole_day(range: &DateTimeRange) -> bool {
-    range.start == range.start.date().midnight().assume_utc()
-        && range.end == midnight_after(range.start)
-}
-
-fn format_date(date: Date) -> String {
-    let format = time::macros::format_description!("[year][month][day]");
-    date.format(format).unwrap_or_else(|_| date.to_string())
+fn stamp(instant: OffsetDateTime) -> String {
+    instant
+        .format(STAMP)
+        .unwrap_or_else(|_| instant.unix_timestamp().to_string())
 }
 
 #[cfg(test)]
@@ -131,33 +147,19 @@ mod tests {
     use time::macros::datetime;
 
     #[test]
-    fn daily_chunks_cover_the_range_exactly() {
-        let range =
-            DateTimeRange::from(datetime!(2024-05-01 0:00 UTC)..datetime!(2024-05-04 0:00 UTC));
-        let chunks = daily_chunks(&range);
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].start, range.start);
-        assert_eq!(chunks.last().unwrap().end, range.end);
-    }
-
-    #[test]
-    fn daily_chunks_clamp_a_partial_final_day() {
-        let range =
-            DateTimeRange::from(datetime!(2024-05-01 12:00 UTC)..datetime!(2024-05-02 6:00 UTC));
-        let chunks = daily_chunks(&range);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].end, datetime!(2024-05-02 0:00 UTC));
-        assert_eq!(chunks[1].end, range.end);
-    }
-
-    #[test]
-    fn whole_day_ranges_get_a_single_date_stamp() {
-        let day =
-            DateTimeRange::from(datetime!(2024-05-01 0:00 UTC)..datetime!(2024-05-02 0:00 UTC));
-        assert_eq!(stamp(&day), "20240501");
-
-        let span =
-            DateTimeRange::from(datetime!(2024-05-01 0:00 UTC)..datetime!(2024-05-04 0:00 UTC));
-        assert_eq!(stamp(&span), "20240501_20240504");
+    fn file_names_carry_both_bounds() {
+        let base = GetRangeParams::builder()
+            .dataset("GLBX.MDP3")
+            .symbols(vec!["ESM4".to_owned()])
+            .schema(databento::dbn::Schema::Trades)
+            .date_time_range(DateTimeRange::from(
+                datetime!(2024-04-30 22:00 UTC)..datetime!(2024-05-01 21:00 UTC),
+            ))
+            .build();
+        let name = file_name(&base, &base.date_time_range);
+        assert_eq!(
+            name.to_str().unwrap(),
+            "GLBX_MDP3.trades.20240430T2200-20240501T2100.dbn.zst"
+        );
     }
 }

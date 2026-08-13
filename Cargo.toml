@@ -10,6 +10,8 @@ license = "MIT"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 databento = "0.58"
+jiff = "0.2"
+sha2 = "0.10"
 time = { version = "0.3", features = ["macros", "parsing", "formatting"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "signal", "time"] }
 tracing = "0.1"

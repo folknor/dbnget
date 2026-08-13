@@ -11,7 +11,7 @@ use tracing::info;
 
 use crate::{
     cli::{BatchCommand, BatchDownloadArgs, BatchListArgs, BatchSubmitArgs},
-    query,
+    query, spend, verify,
 };
 
 pub async fn run(client: &mut HistoricalClient, command: &BatchCommand) -> Result<()> {
@@ -25,6 +25,15 @@ pub async fn run(client: &mut HistoricalClient, command: &BatchCommand) -> Resul
 
 async fn submit(client: &mut HistoricalClient, args: &BatchSubmitArgs) -> Result<()> {
     let params = submit_params(args)?;
+    let quote = spend::fetch(client, &query::metadata_params(&args.query)?).await?;
+
+    if !args.confirm {
+        println!("would submit: {} {} {quote}", params.dataset, params.schema);
+        println!("pass --confirm --max-dollars USD to submit");
+        return Ok(());
+    }
+    spend::approve(&quote, args.max_dollars)?;
+
     let job = client
         .batch()
         .submit_job(&params)
@@ -126,16 +135,36 @@ async fn download_files(
         .await
         .with_context(|| format!("creating output directory {}", out.display()))?;
 
+    let manifest = client
+        .batch()
+        .list_files(job_id)
+        .await
+        .with_context(|| format!("listing files for job {job_id}"))?;
+    for file in &manifest {
+        verify::checked_file_name(&file.filename)?;
+    }
+
     let params = DownloadParams::builder()
         .output_dir(out)
         .job_id(job_id)
         .maybe_filename_to_download(filename)
         .build();
-    let paths = client
+    client
         .batch()
         .download(&params)
         .await
         .with_context(|| format!("downloading job {job_id}"))?;
+
+    // The client puts a job's files in a directory named after the job.
+    let job_dir = out.join(job_id);
+    let wanted: Vec<_> = match filename {
+        Some(name) => manifest
+            .into_iter()
+            .filter(|f| f.filename == name)
+            .collect(),
+        None => manifest,
+    };
+    let paths = verify::job_files(&job_dir, &wanted).await?;
 
     for path in &paths {
         println!("{}", path.display());

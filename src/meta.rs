@@ -5,7 +5,7 @@ use databento::HistoricalClient;
 
 use crate::{
     cli::{MetaCommand, QueryArgs},
-    query,
+    query, spend,
 };
 
 pub async fn run(client: &mut HistoricalClient, command: &MetaCommand) -> Result<()> {
@@ -18,28 +18,21 @@ pub async fn run(client: &mut HistoricalClient, command: &MetaCommand) -> Result
 }
 
 /// Prints the record count, billable size and price of a query without fetching it.
+///
+/// A quote of $0.00 is not self-explanatory. Under an active subscription a covered
+/// request prices at zero because it is already paid for, but a request whose symbols
+/// match nothing prices at zero too, so the record count is printed alongside.
 pub async fn cost(client: &mut HistoricalClient, args: &QueryArgs) -> Result<()> {
     let params = query::metadata_params(args)?;
+    let quote = spend::fetch(client, &params).await?;
 
-    let records = client
-        .metadata()
-        .get_record_count(&params)
-        .await
-        .context("fetching record count")?;
-    let billable = client
-        .metadata()
-        .get_billable_size(&params)
-        .await
-        .context("fetching billable size")?;
-    let usd = client
-        .metadata()
-        .get_cost(&params)
-        .await
-        .context("fetching cost")?;
-
-    println!("records:       {records}");
-    println!("billable size: {billable} bytes");
-    println!("cost:          ${usd:.2}");
+    println!("records:       {}", quote.records);
+    println!("billable size: {} bytes", quote.billable_bytes);
+    println!("cost:          ${:.2}", quote.usd);
+    if quote.is_empty() {
+        println!();
+        println!("This query matches no records. A $0.00 quote here means empty, not free.");
+    }
     Ok(())
 }
 
