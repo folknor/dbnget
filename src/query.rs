@@ -1,18 +1,13 @@
-//! Turns the flat CLI arguments into the parameter types the Databento client wants.
+//! Parsing the flat CLI arguments into the types the Databento client wants.
 
 use anyhow::{Context, Result, bail};
 use databento::{
     Symbols,
-    historical::{
-        DateTimeRange,
-        batch::{JobState, SplitDuration},
-        metadata::GetQueryParams,
-        timeseries::GetRangeParams,
-    },
+    historical::{DateTimeRange, batch::JobState},
 };
 use time::{Date, Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::cli::{CliCompression, CliEncoding, CliJobState, CliSplitDuration, QueryArgs};
+use crate::cli::{CliFormat, CliJobState};
 
 /// The sentinel the Databento API uses to mean "every symbol in the dataset".
 const ALL_SYMBOLS: &str = "ALL_SYMBOLS";
@@ -36,10 +31,11 @@ pub fn parse_date(raw: &str) -> Result<Date> {
 /// Resolves `--start` / `--end` into a half-open range.
 ///
 /// A bare `--start` date with no `--end` covers exactly that one UTC day, which is what
-/// a single-day pull almost always means.
-pub fn date_time_range(args: &QueryArgs) -> Result<DateTimeRange> {
-    let start = parse_instant(&args.start)?;
-    let end = match args.end.as_deref() {
+/// a single-day pull almost always means. Both bounds are normalized to UTC instants so
+/// that a re-run keys to the same job the first run bought.
+pub fn date_time_range(start: &str, end: Option<&str>) -> Result<DateTimeRange> {
+    let start = parse_instant(start)?;
+    let end = match end {
         Some(raw) => parse_instant(raw)?,
         None => start + Duration::days(1),
     };
@@ -52,7 +48,7 @@ pub fn date_time_range(args: &QueryArgs) -> Result<DateTimeRange> {
 /// Builds the symbol selector, treating `ALL_SYMBOLS` and `*` as the whole dataset.
 pub fn symbols(raw: &[String]) -> Result<Symbols> {
     if raw.is_empty() {
-        bail!("at least one --symbols value is required (use ALL_SYMBOLS for everything)");
+        bail!("at least one symbol is required (use ALL_SYMBOLS for everything)");
     }
     if raw
         .iter()
@@ -66,58 +62,12 @@ pub fn symbols(raw: &[String]) -> Result<Symbols> {
     Ok(Symbols::Symbols(raw.to_vec()))
 }
 
-/// Builds the parameters for a streaming timeseries request.
-pub fn range_params(args: &QueryArgs) -> Result<GetRangeParams> {
-    Ok(GetRangeParams::builder()
-        .dataset(&args.dataset)
-        .symbols(symbols(&args.symbols)?)
-        .schema(args.schema)
-        .date_time_range(date_time_range(args)?)
-        .stype_in(args.stype_in)
-        .stype_out(args.stype_out)
-        .maybe_limit(args.limit)
-        .build())
-}
-
-/// Builds the parameters for the metadata endpoints that price a query.
-pub fn metadata_params(args: &QueryArgs) -> Result<GetQueryParams> {
-    Ok(GetQueryParams::builder()
-        .dataset(&args.dataset)
-        .symbols(symbols(&args.symbols)?)
-        .schema(args.schema)
-        .date_time_range(date_time_range(args)?)
-        .stype_in(args.stype_in)
-        .maybe_limit(args.limit)
-        .build())
-}
-
-impl From<CliEncoding> for databento::dbn::Encoding {
-    fn from(value: CliEncoding) -> Self {
+impl From<CliFormat> for databento::dbn::Encoding {
+    fn from(value: CliFormat) -> Self {
         match value {
-            CliEncoding::Dbn => Self::Dbn,
-            CliEncoding::Csv => Self::Csv,
-            CliEncoding::Json => Self::Json,
-        }
-    }
-}
-
-impl From<CliCompression> for databento::dbn::Compression {
-    fn from(value: CliCompression) -> Self {
-        match value {
-            CliCompression::None => Self::None,
-            CliCompression::Zstd => Self::Zstd,
-        }
-    }
-}
-
-impl From<CliSplitDuration> for SplitDuration {
-    fn from(value: CliSplitDuration) -> Self {
-        match value {
-            CliSplitDuration::Day => Self::Day,
-            CliSplitDuration::Week => Self::Week,
-            CliSplitDuration::Month => Self::Month,
-            CliSplitDuration::Year => Self::Year,
-            CliSplitDuration::None => Self::None,
+            CliFormat::Dbn => Self::Dbn,
+            CliFormat::Csv => Self::Csv,
+            CliFormat::Json => Self::Json,
         }
     }
 }
@@ -143,17 +93,7 @@ mod tests {
 
     #[test]
     fn bare_date_start_covers_one_day() {
-        let args = QueryArgs {
-            dataset: "GLBX.MDP3".to_owned(),
-            schema: databento::dbn::Schema::Trades,
-            symbols: vec!["ESM4".to_owned()],
-            start: "2024-05-01".to_owned(),
-            end: None,
-            stype_in: databento::dbn::SType::RawSymbol,
-            stype_out: databento::dbn::SType::InstrumentId,
-            limit: None,
-        };
-        let range = date_time_range(&args).unwrap();
+        let range = date_time_range("2024-05-01", None).unwrap();
         assert_eq!(range.end - range.start, Duration::days(1));
     }
 
@@ -169,16 +109,6 @@ mod tests {
 
     #[test]
     fn end_must_follow_start() {
-        let args = QueryArgs {
-            dataset: "GLBX.MDP3".to_owned(),
-            schema: databento::dbn::Schema::Trades,
-            symbols: vec!["ESM4".to_owned()],
-            start: "2024-05-02".to_owned(),
-            end: Some("2024-05-01".to_owned()),
-            stype_in: databento::dbn::SType::RawSymbol,
-            stype_out: databento::dbn::SType::InstrumentId,
-            limit: None,
-        };
-        assert!(date_time_range(&args).is_err());
+        assert!(date_time_range("2024-05-02", Some("2024-05-01")).is_err());
     }
 }

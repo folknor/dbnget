@@ -1,16 +1,15 @@
-mod batch;
 mod cli;
 mod disk;
-mod get;
+mod fetch;
+mod jobs;
 mod meta;
 mod query;
-mod session;
 mod spend;
 mod verify;
 
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use databento::HistoricalClient;
 use tracing_subscriber::EnvFilter;
@@ -57,10 +56,9 @@ async fn run() -> Result<Outcome> {
 
     let mut client = build_client(args.key.as_deref())?;
     match &args.command {
-        Command::Get(get_args) => get::run(&mut client, get_args).await,
-        Command::Cost(query_args) => meta::cost(&mut client, query_args).await,
-        Command::Batch(command) => batch::run(&mut client, command).await,
-        Command::Meta(command) => meta::run(&mut client, command).await,
+        Some(Command::List(list_args)) => jobs::list(&mut client, list_args).await,
+        Some(Command::Meta(command)) => meta::run(&mut client, command).await,
+        None => fetch::run(&mut client, &args.fetch).await,
     }
 }
 
@@ -80,11 +78,60 @@ fn init_tracing(verbosity: u8) {
 }
 
 fn build_client(key: Option<&str>) -> Result<HistoricalClient> {
-    let builder = HistoricalClient::builder();
-    let builder = match key {
-        Some(key) => builder.key(key),
-        None => builder.key_from_env(),
+    let key = key
+        .map(resolve_key)
+        .transpose()?
+        .context("no API key: pass --key or set DATABENTO_API_KEY")?;
+    HistoricalClient::builder()
+        .key(key)
+        .context("the API key was not accepted")?
+        .build()
+        .context("building the Databento client")
+}
+
+/// A key looks like `db-...`. Anything else is read as a path to a file holding the
+/// key and nothing else, with surrounding whitespace trimmed. The environment
+/// variable gets the same treatment as the flag.
+fn resolve_key(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.starts_with("db-") {
+        return Ok(raw.to_owned());
     }
-    .context("no API key: pass --key or set DATABENTO_API_KEY")?;
-    builder.build().context("building the Databento client")
+    let contents = std::fs::read_to_string(raw).with_context(|| {
+        format!("`{raw}` does not start with `db-`, and reading it as a key file failed")
+    })?;
+    let key = contents.trim();
+    if !key.starts_with("db-") {
+        bail!("key file `{raw}` does not contain a `db-` API key");
+    }
+    Ok(key.to_owned())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "assertions in tests should panic loudly"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_literal_key_passes_through() {
+        assert_eq!(resolve_key("db-abc123").unwrap(), "db-abc123");
+        assert_eq!(resolve_key("  db-abc123\n").unwrap(), "db-abc123");
+    }
+
+    #[test]
+    fn a_key_file_is_read_and_trimmed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-keys");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("databento.key");
+        std::fs::write(&path, "db-fromfile\n").unwrap();
+        assert_eq!(resolve_key(path.to_str().unwrap()).unwrap(), "db-fromfile");
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error() {
+        assert!(resolve_key("/nonexistent/key/path").is_err());
+    }
 }

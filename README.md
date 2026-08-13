@@ -9,111 +9,122 @@ data, built on the official `databento` Rust client.
 brokkr install
 ```
 
-The API key is read from `DATABENTO_API_KEY`, or passed with `--key`.
+### The API key
 
-## Commands
+`--key` takes either the key itself or a path:
 
-### `get` - stream a range to DBN files
+- A value starting with `db-` is the API key.
+- Anything else is read as a path to a file holding the key and nothing else;
+  surrounding whitespace is trimmed.
+- Absent, it falls back to `DATABENTO_API_KEY`, which gets the same treatment.
+
+## The single verb
 
 ```sh
-dbnget get -d GLBX.MDP3 -s trades -S ESM4,NQM4 --start 2024-05-01 --end 2024-05-08 -o data
+dbnget ESM4 NQM4 -d GLBX.MDP3 -s trades --start 2024-05-01 --end 2024-05-08 -o data
 ```
 
-A bare `--start` date with no `--end` covers exactly that one UTC day.
+Symbols are positional. A bare `--start` date with no `--end` covers exactly that one
+UTC day. `--format dbn|csv|json` picks the delivered encoding, always zstd-compressed
+and split into one file per day.
 
-`--split` issues one request, and writes one file, per trading session. Each file is
-downloaded to a `.partial` sidecar and renamed only once complete, so re-running the
-same command after an interruption resumes at the first missing session. `--force`
-re-downloads sessions that are already present.
+The command is the state machine. The whole request is one batch job on the vendor's
+account (Databento keeps a multi-symbol submit as a single job), and each run
+reconciles the request against the account:
 
-Files are named `DATASET.SCHEMA.START-END.dbn.zst`, e.g.
-`GLBX_MDP3.trades.20240430T2200-20240501T2100.dbn.zst`. Both bounds are in the name
-because a session is not a calendar day.
+- **No matching job**: queue one, subject to the spend gate, and exit 3.
+- **A matching job is still preparing**: report its state, how long it has been in
+  it, and the vendor's percent completion, and exit 3.
+- **A matching job is done**: download it into `OUT/JOB_ID/`, verify every file, and
+  exit 0.
 
-#### Sessions are not UTC days
+Re-running the same command *is* the poll loop. Matching is on the request itself -
+dataset, schema, symbols as a case-insensitive set, bounds, symbology, format -
+because the vendor's job listing is the only account of what was actually bought.
+There is no local ledger; a re-run of a command whose first attempt succeeded adopts
+the existing job instead of buying the same data twice. The one gap is the window
+between the submit POST being charged and the job appearing in the listing: a process
+that dies in it can submit twice on re-run.
 
-Databento reads a date-only bound as UTC midnight. For a venue whose trading day starts
-somewhere else that is the wrong boundary: a CME session runs from 17:00 the previous
-day to 16:00 America/Chicago, so splitting on UTC midnight clips the front of each
-opening session and pulls in the same slice of the session after it.
+### Exit codes
 
-`--session` picks the convention, and defaults to `auto`:
-
-| Value | Trading day |
+| Code | Meaning |
 |---|---|
-| `auto` | derived from the dataset code |
-| `cme` | 17:00 previous day to 16:00 America/Chicago, DST-aware |
-| `utc` | the UTC calendar day |
+| 0 | Settled. The work is done. |
+| 3 | Nonterminal. Nothing is wrong; the data is not ready yet. Run the same command again. |
+| 1 | Failed. |
 
-`auto` maps `GLBX*` to `cme` and everything else to `utc`. Under `cme` the 16:00-17:00
-maintenance break is not part of any session and is never requested, so consecutive
-chunks do not tile the calendar.
+A batch job that is still queued is neither a success nor a failure, so it gets its
+own code. That lets a shell drive a wave of requests without dbnget tracking them:
+submit everything first (the vendor prepares jobs in parallel), then re-run the same
+commands until none exits 3.
 
-Measured against `GLBX.MDP3` tbbo for `ES.FUT` on Sunday 2026-08-09:
+### The spend gate: `--spend`
 
-| Window (UTC) | Records |
-|---|---|
-| 00:00 → 22:00 | 0 |
-| 22:00 → 24:00 | 5,919 |
+Without `--spend`, any request that would cost more than $0.00 is refused with the
+quoted price. Databento prices a request an active subscription already covers at
+exactly $0.00, so the default is "fetch only what I have already paid for":
 
-22:00 UTC is 17:00 CDT. The week's first session opens on Sunday evening, so splitting
-on UTC midnight files two hours of Monday's session under Sunday and cuts the session in
-half.
-
-#### Skipping empty sessions
-
-`--skip-empty` asks `metadata.get_record_count` whether each chunk holds anything, and
-skips it if not. That endpoint is unbilled, so weekends, holidays and closures are
-skipped without a holiday calendar and without spending anything. It costs one metadata
-round-trip per chunk.
-
-Note that `metadata.get_dataset_condition` cannot be used for this: it reports dataset
-ingestion status, and answers `available` for Christmas Day and for every Saturday.
-
-The pre-pass is sequential, so a year of sessions is a few hundred round-trips before
-the first byte lands. Worth it when closures are common, not worth it for a handful of
-chunks you already know are populated.
-
-#### `get` does not gate spending
-
-`batch submit` refuses to charge you without `--confirm` and `--max-dollars`. **`get`
-has no such gate** and starts billing immediately. Price the range with `cost` first if
-that matters:
-
-```sh
-dbnget cost -d GLBX.MDP3 -s mbp-1 -S ES.v.0 --stype-in continuous \
-    --start 2024-05-01 --end 2024-06-01
+```
+$ dbnget ES.FUT --stype-in parent -d GLBX.MDP3 -s tbbo --start 2020-05-04 --end 2020-05-05
+Error: this request costs $0.79 (377685 records, 30214800 billable bytes, $0.79);
+pass --spend USD to approve the charge
 ```
 
-The protection is on the path that is easier to undo rather than the one that bills
-fastest, which is backwards. Fixing it means a `--max-dollars` on `get` too.
+`--spend USD` caps what a run may charge. A quote above the cap refuses rather than
+truncating the request to fit; a non-finite quote is refused; and a request matching
+zero records is an error, not a free pass - a $0.00 quote can mean "covered" or
+"matches nothing", and the record count disambiguates.
 
-### `cost` - price a query before running it
+The vendor deletes a job's prepared files about 30 days after completion. An expired
+job is not adoptable, so re-running its command quotes full price like a fresh query
+- but dbnget warns that the job expired and that proceeding is a re-purchase, rather
+than hiding it behind a generic refusal.
 
-```sh
-dbnget cost -d GLBX.MDP3 -s mbo -S ESM4 --start 2024-05-01 --end 2024-06-01
-```
-
-Prints the record count, billable size and USD cost.
-
-A quote of $0.00 is ambiguous. Under an active subscription a covered request prices at
-zero because it is already paid for, but a request whose symbols match nothing prices at
-zero too. The record count disambiguates, and an empty query says so explicitly.
-
-### `batch` - submit and collect batch jobs
+### `--cost`: price it first
 
 ```sh
-dbnget batch submit -d GLBX.MDP3 -s trades -S ALL_SYMBOLS \
-    --start 2024-05-01 --end 2024-06-01 --split-duration month \
-    --confirm --max-dollars 50 --wait-and-download data/
-
-dbnget batch list --state queued,processing
-dbnget batch status JOB_ID
-dbnget batch download JOB_ID -o data/ --wait
+dbnget ES.v.0 --stype-in continuous -d GLBX.MDP3 -s mbp-1 --start 2024-05-01 --end 2024-06-01 --cost
 ```
 
-`batch list` shows the symbols a job covers, qualified by their symbology, because
-`ES.FUT` is one instrument as a raw symbol and every ES future as a parent symbol:
+Prints the record count, billable size and USD cost, and stops. Never queues.
+
+### `--immediate`: stream it now
+
+One plain streaming request, written straight to disk as
+`DATASET.SCHEMA.START-END.dbn.zst`. DBN only - the streaming API does not deliver
+CSV or JSON. The spend gate applies exactly as above; streaming bills the moment the
+request is issued.
+
+There is no session splitting, resume, or empty-day pre-pass here. That machinery
+existed when streaming was the primary path; with batch as the default, the vendor
+does the splitting.
+
+### Verified downloads
+
+The client checks batch checksums itself, but on a mismatch it logs a warning and
+returns success, and it skips a file whose size already matches without re-reading
+it. dbnget re-checks size and SHA-256 against the job manifest after every download
+and fails if either disagrees, so a corrupt file cannot be mistaken for a complete
+one by whatever runs next. Files ending in `.zst` are also checked for a zstd frame
+header, and manifest filenames are rejected unless they are plain file names, since
+they are joined onto the output directory.
+
+`--min-free-gb` refuses to start a download when the output filesystem is below the
+floor, rather than filling it and taking the rest of the machine down with it.
+
+## `dbnget list`
+
+```sh
+dbnget list
+dbnget list --state queued,processing
+```
+
+Lists the jobs on the account: ID, state, dataset, schema, symbols qualified by their
+symbology (`ES.FUT` is one instrument as a raw symbol and every ES future as a parent
+symbol), range, cost and size. It is the tool for checking what already exists before
+submitting - a widened `--end` is a new job that re-purchases the old range, and
+dbnget does not warn about overlaps.
 
 ```
 GLBX-20260812-MUCPBX5U6K  Done  GLBX.MDP3  tbbo    continuous:ES.v.0   2025-08-12..2025-08-31   $0.00  347.8 MiB
@@ -122,97 +133,7 @@ GLBX-20260805-JUBCRPRLG8  Done  GLBX.MDP3  trades  continuous:NQ.v.0,MNQ.v.0  20
 
 Long symbol lists are truncated with a count of what was left out.
 
-#### Exit codes, and driving a wave from the shell
-
-| Code | Meaning |
-|---|---|
-| 0 | Settled. The work is done. |
-| 3 | Nonterminal. Nothing is wrong; the data is not ready yet. Run the same command again. |
-| 1 | Failed. |
-
-A batch job that is still queued is neither a success nor a failure, so it gets its own
-code. That makes re-invoking `dbnget` the poll loop, and lets a shell drive a wave of
-jobs without `dbnget` having to track them:
-
-```sh
-# Phase 1: submit everything. Vendor-side preparation runs in parallel.
-for month in 2024-0{1,2,3,4,5,6}; do
-    dbnget batch submit -d GLBX.MDP3 -s trades -S ES.FUT --stype-in parent \
-        --start "$month-01" --end "$(date -d "$month-01 +1 month" +%F)" \
-        --confirm --max-dollars 50
-done
-
-# Phase 2: collect. Re-run until nothing exits 3.
-dbnget batch list --state done | while read -r job _; do
-    dbnget batch download "$job" -o data/
-done
-```
-
-Submitting the whole wave before waiting for any of it matters: the vendor prepares jobs
-in parallel, so a submit-wait-submit-wait loop leaves that capacity idle. Downloads, by
-contrast, are left serial on purpose - they are bandwidth-bound, so running them
-concurrently just divides one pipe and multiplies the partial files in flight.
-
-#### Waiting
-
-`--wait` and `--wait-and-download` poll until the job reaches `done`. The first poll is
-`--poll-interval` seconds away and the gap doubles up to `--max-poll-interval`, so a job
-that takes hours does not generate hundreds of pointless requests.
-
-Waiting stops after `--max-wait` minutes and exits 3. **That is not a failure** - a
-month of MBP-1 legitimately takes hours to prepare, the job keeps preparing whether or
-not anything is watching, and re-running the same command picks it back up. A job that
-expires before it could be downloaded *is* a failure.
-
-`--min-free-gb` refuses to start a download when the output filesystem is below the
-floor, rather than filling it and taking the rest of the machine down with it.
-
-#### Submitting is idempotent
-
-Before submitting, `dbnget` asks the vendor for the jobs already on the account and
-adopts any live job whose request matches - same dataset, schema, symbols, bounds,
-symbology and output format. Re-running a command whose first attempt succeeded picks
-the existing job back up instead of buying the same data twice.
-
-The match is on the request itself rather than on any local record, because the vendor
-is the only account of what was actually bought. Expired jobs are not adoptable: they
-have no downloadable files left. This is deliberately stateless - there is no local
-ledger - which leaves one gap: if the process dies in the window between the POST
-being charged and the job becoming visible in the listing, a re-run can submit twice.
-
-#### Submitting costs money, so it is gated
-
-`batch submit` prices the request and stops. It submits nothing unless given both
-`--confirm` and `--max-dollars`, and refuses if the live quote exceeds the cap rather
-than truncating the request to fit. A quote that is not a finite number is refused, as
-is a request that matches no records.
-
-`--max-dollars 0` is the useful setting on a subscription. Databento prices a request
-your subscription already covers at exactly $0.00 and an uncovered one at list price, so
-a zero cap means "fetch only what I have already paid for":
-
-```
-$ dbnget batch submit -d GLBX.MDP3 -s tbbo -S ES.FUT --stype-in parent \
-      --start 2020-05-04 --end 2020-05-05 --confirm --max-dollars 0
-Error: quoted $0.79 exceeds the --max-dollars cap of $0.00
-```
-
-The same request inside the entitlement window quotes $0.00 and passes.
-
-#### Downloaded files are verified
-
-The client checks batch checksums itself, but on a mismatch it logs a warning and
-returns success, and it skips a file whose size already matches without re-reading it.
-`dbnget` re-checks size and SHA-256 against the job manifest after every download and
-fails if either disagrees, so a corrupt file cannot be mistaken for a complete one by
-whatever runs next. Files ending in `.zst` are also checked for a zstd frame header,
-which catches the case where the delivered bytes are intact but are not the compressed
-data they claim to be. Manifest filenames are rejected unless they are plain file names,
-since they are joined onto the output directory.
-
-Files land in `OUT/JOB_ID/`.
-
-### `meta` - dataset metadata
+## `dbnget meta` - dataset metadata
 
 ```sh
 dbnget meta datasets

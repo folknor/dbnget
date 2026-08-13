@@ -63,16 +63,15 @@ pub async fn fetch(client: &mut HistoricalClient, params: &GetQueryParams) -> Re
     })
 }
 
-/// Refuses anything the cap does not clearly permit.
+/// Refuses anything `--spend` does not clearly permit.
 ///
-/// The comparisons are written so a non-finite quote or cap cannot pass: NaN compares
+/// No `--spend` means a cap of $0.00: on a subscription a covered request quotes
+/// exactly zero, so the default is "fetch only what I have already paid for". The
+/// comparisons are written so a non-finite quote or cap cannot pass: NaN compares
 /// false against everything, so `usd <= cap` would wave one straight through.
-pub fn approve(quote: &Quote, max_dollars: Option<f64>) -> Result<()> {
-    let Some(cap) = max_dollars else {
-        bail!("--confirm requires --max-dollars: refusing to submit an unbounded charge");
-    };
-    if !cap.is_finite() || cap < 0.0 {
-        bail!("--max-dollars must be a finite, non-negative number, not {cap}");
+pub fn approve(quote: &Quote, spend: Option<f64>) -> Result<()> {
+    if quote.is_empty() {
+        bail!("this request matches no records - check the symbols, dataset and date range");
     }
     if !quote.usd.is_finite() {
         bail!(
@@ -80,14 +79,21 @@ pub fn approve(quote: &Quote, max_dollars: Option<f64>) -> Result<()> {
             quote.usd
         );
     }
+    let cap = spend.unwrap_or(0.0);
+    if !cap.is_finite() || cap < 0.0 {
+        bail!("--spend must be a finite, non-negative number, not {cap}");
+    }
     if quote.usd > cap {
+        if spend.is_none() {
+            bail!(
+                "this request costs ${:.2} ({quote}); pass --spend USD to approve the charge",
+                quote.usd
+            );
+        }
         bail!(
-            "quoted ${:.2} exceeds the --max-dollars cap of ${cap:.2}",
+            "quoted ${:.2} exceeds the --spend cap of ${cap:.2}",
             quote.usd
         );
-    }
-    if quote.is_empty() {
-        bail!("this request matches no records - check the symbols, dataset and date range");
     }
     Ok(())
 }
@@ -120,8 +126,9 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_cap_is_refused() {
-        assert!(approve(&quote(0.0, 100), None).is_err());
+    fn no_spend_flag_means_a_zero_cap() {
+        approve(&quote(0.0, 100), None).unwrap();
+        assert!(approve(&quote(0.01, 100), None).is_err());
     }
 
     #[test]
@@ -135,5 +142,6 @@ mod tests {
     #[test]
     fn a_free_but_empty_request_is_refused() {
         assert!(approve(&quote(0.0, 0), Some(10.0)).is_err());
+        assert!(approve(&quote(0.0, 0), None).is_err());
     }
 }
