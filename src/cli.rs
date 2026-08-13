@@ -91,11 +91,6 @@ pub struct FetchArgs {
     /// Price the request and stop. Never queues or downloads anything.
     #[arg(long)]
     pub cost: bool,
-
-    /// Refuse to start a download when the output filesystem has less than this many
-    /// gibibytes free. Zero disables the check.
-    #[arg(long, default_value_t = 1, value_name = "GIB")]
-    pub min_free_gb: u64,
 }
 
 #[derive(Debug, Args)]

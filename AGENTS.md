@@ -67,10 +67,11 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   so a changed second response would reintroduce a path that was already checked.
   Destinations are also refused when a symbolic link already sits there, checked
   before the write rather than after.
-- **Free space is checked before EVERY file, counting that file's size.** A month of
-  MBP-1 is tens of gigabytes across many files; a floor-only check consulted once lets
-  a run start each file legally and still finish below the floor. Running the
-  filesystem dry leaves a partial file and takes the machine down with it.
+- **Free space is the kernel's problem.** dbnget does not police disk space. No POSIX
+  tool does - `curl`, `wget`, `cp` and `dd` all write until the filesystem returns
+  ENOSPC and report the error. A `--min-free-gb` flag existed and was removed: it
+  reimplemented a check the kernel already performs, turned a full disk into an exit
+  code indistinguishable from a real failure, and shipped enabled by default.
 - **`--immediate` never overwrites and never leaves a partial file under the final
   name.** The request is billed before a byte arrives, so truncating an existing
   result destroys data that was paid for; and with no manifest to verify against, a
@@ -120,7 +121,6 @@ Detail lives in the code; this is the map.
 - `spend.rs` - quoting and the spend gate.
 - `verify.rs` - post-download size + SHA-256 verification against the manifest, the
   zstd frame-header check, and manifest filename validation.
-- `disk.rs` - free-space checks (available, not free) ahead of each download.
 
 ## Rules
 

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `--min-free-gb`, and the disk module behind it. Refusing to start a download because
+  the filesystem is near full reimplements a check the kernel already performs, and
+  turns a full disk into a refusal that a shell loop cannot tell from a real failure.
+  No POSIX tool does this: write until ENOSPC and report the error.
+
 ### Fixed
 
 - Job matching now compares every output-affecting submission field (`pretty_px`,
@@ -19,8 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Batch files are downloaded one at a time by validated name. Handing the whole job to
   the client's download-all re-fetched the manifest internally and built paths from
   that second response, so the validated filenames were not the ones written.
-- The free-space floor is checked before every file and accounts for that file's size,
-  rather than once per job.
 - The job id is validated as a path component before being used as one.
 - An empty job already on the account is refused on adoption, and a done job with an
   empty manifest is an error. Both previously exited 0.

@@ -1,6 +1,5 @@
 mod cli;
 mod dataset;
-mod disk;
 mod fetch;
 mod jobs;
 mod query;

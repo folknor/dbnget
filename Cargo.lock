@@ -476,7 +476,6 @@ dependencies = [
  "clap",
  "databento",
  "jiff",
- "rustix",
  "sha2",
  "time",
  "tokio",

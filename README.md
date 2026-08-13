@@ -131,12 +131,6 @@ each verified before the next one starts. The client's download-all re-fetches t
 manifest internally and builds paths from that second copy, so the names checked would
 not be the names written.
 
-`--min-free-gb` refuses to start a download when the output filesystem is below the
-floor, rather than filling it and taking the rest of the machine down with it. The check
-runs before every file and counts that file's size against the floor, since a job is
-many files and a run that only checks once can start each file legally and still finish
-below the floor.
-
 ## `dbnget list`
 
 ```sh

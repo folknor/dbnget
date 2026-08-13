@@ -11,7 +11,7 @@ use databento::{
 };
 use time::OffsetDateTime;
 
-use crate::{Outcome, cli::ListArgs, disk, query, verify};
+use crate::{Outcome, cli::ListArgs, query, verify};
 
 /// `dbnget list` - the vendor's job listing is the only account of what was bought,
 /// and this is the user's tool for checking it before submitting.
@@ -168,12 +168,7 @@ fn same_symbols(left: &Symbols, right: &Symbols) -> bool {
 
 /// Downloads a finished job into `out/JOB_ID/` and verifies every file against the
 /// manifest. Prints the verified paths.
-pub async fn download(
-    client: &mut HistoricalClient,
-    job_id: &str,
-    out: &Path,
-    min_free_gb: u64,
-) -> Result<Outcome> {
+pub async fn download(client: &mut HistoricalClient, job_id: &str, out: &Path) -> Result<Outcome> {
     // The job id becomes a path component, and it arrives from the same response the
     // filenames do. It gets the same treatment.
     let job_id = verify::checked_file_name(job_id)
@@ -182,7 +177,6 @@ pub async fn download(
     tokio::fs::create_dir_all(out)
         .await
         .with_context(|| format!("creating output directory {}", out.display()))?;
-    disk::check_floor(out, min_free_gb)?;
 
     let manifest = client
         .batch()
@@ -205,13 +199,10 @@ pub async fn download(
     // One file at a time, from the manifest validated above. Handing the whole job to
     // the client's download-all instead would re-fetch the manifest inside it and build
     // every path from that second response, so the names checked here would not be the
-    // names written - and the free-space floor would be consulted once for a job that
-    // writes tens of gigabytes across many files.
+    // names written.
     let mut paths = Vec::with_capacity(manifest.len());
     for desc in &manifest {
         let name = verify::checked_file_name(&desc.filename)?;
-        disk::check_room_for(out, min_free_gb, desc.size)?;
-
         let path = job_dir.join(name);
         verify::no_symlink(&path)?;
 

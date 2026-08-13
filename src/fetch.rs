@@ -115,7 +115,7 @@ async fn reconcile(
                     );
                 }
                 info!(job_id = %job.id, "adopting finished job");
-                jobs::download(client, &job.id, &args.output, args.min_free_gb).await
+                jobs::download(client, &job.id, &args.output).await
             }
             _ => {
                 report_pending(&job);
@@ -382,7 +382,6 @@ mod tests {
             immediate: false,
             spend: None,
             cost: false,
-            min_free_gb: 1,
         };
         let err = validate(&args).unwrap_err().to_string();
         assert!(err.contains("--dataset"), "{err}");
