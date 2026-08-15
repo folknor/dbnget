@@ -203,10 +203,27 @@ well, so when it cannot answer, the line is simply absent and the quote stands.
 ### `--immediate`: stream it now
 
 One plain streaming request, written straight to disk as
-`DATASET.SCHEMA.START-END.dbn.zst`, where the bounds carry seconds (and nanoseconds
-when they have them) so two requests that differ below the minute cannot land on one
-name. DBN only - the streaming API does not deliver CSV or JSON. Streaming bills the
-moment the request is issued.
+`DATASET.SCHEMA.SYMBOLS.START-END.KEY.dbn.zst`:
+
+```
+data/EQUS_MINI.ohlcv-1m.AAPL.20250602T000000-20250607T000000.49a8ed20dca417be.dbn.zst
+```
+
+DBN only - the streaming API does not deliver CSV or JSON. Streaming bills the moment
+the request is issued.
+
+The bounds carry seconds, and nanoseconds when they have them, so two requests that
+differ below the minute cannot land on one name. The trailing `KEY` is a digest of the
+whole request - the same fields adoption matches on: symbols, symbology in and out,
+bounds and limit, alongside the dataset and schema already spelled out. Two requests
+that differ in any of them get different files, and two spellings of one request (symbols
+reordered, recased or repeated) get the same file, exactly as adoption treats them.
+
+The symbol segment is a convenience for reading the directory and the key is what
+actually separates the files. It is sanitized rather than validated, since a symbol is
+under no obligation to be a legal filename - `ES:FUT` is ordinary as a symbol and illegal
+on Windows - and it is truncated with a count when a request names more symbols than fit.
+Anything the hint blurs, the key still distinguishes.
 
 **The spend gate is weaker here.** The cost endpoint prices the batch feed mode and
 takes no parameter to ask about another, so the quote `--spend` is checked against is a

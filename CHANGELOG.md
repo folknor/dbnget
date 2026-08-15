@@ -45,6 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the suggestion actually works, and mention that a matching job already on the
   account is adopted rather than re-bought. Adoption was previously documented only
   inside the help for the positional symbols argument.
+- `--immediate` output filenames key on the whole request, not just dataset, schema and
+  range. Two symbols fetched over one window previously shared a path, and the second
+  request was told the first's file was data it had already paid for: following that
+  advice discards the first instrument's data, ignoring it never yields the second, and
+  under a script it exits nonzero over a file holding the wrong instrument. Names now
+  carry a symbol segment and a digest of the fields adoption matches on - symbols,
+  symbology in and out, bounds and limit - so different requests get different files
+  and two spellings of one request still get the same file. **Existing `--immediate`
+  files keep their old names; nothing reads them back, but a re-run writes to the new
+  name rather than recognising the old one.**
 - `--immediate` distinguishes an abandoned zero-byte claim from a file holding data.
   The old message told users they had already paid for what was an empty husk left by
   a refused run.

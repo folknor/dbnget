@@ -153,8 +153,18 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   releases the claims so a retry is possible - and so does a refusal by the spend gate,
   which is the case that was missed: a run that charged nothing left two empty files
   behind, and the next run reported the data as already paid for. Nothing after the
-  first byte arrives may release a claim. Filenames carry seconds and nanoseconds
-  because minute precision let two differently-priced requests collide.
+  first byte arrives may release a claim. THE FILE NAME MUST KEY ON THE WHOLE REQUEST,
+  for the same reason the match key does: it carried only dataset, schema and range, so
+  AAPL and MSFT over one window shared a path, and the second request was told the
+  first's file was data it had already paid for - advice that destroys the first
+  instrument's data if followed, never yields the second if ignored, and under a script
+  exits nonzero over a file holding the wrong instrument. Symbols, symbology in and out,
+  bounds and limit now go through `jobs::canonical_symbols` into a digest appended to
+  the name, so the two definitions of "the same request" cannot drift apart. Filenames
+  carry seconds and nanoseconds because minute precision let two differently-priced
+  requests collide. The symbol segment beside the digest is a READING convenience and is
+  sanitized, never validated: a symbol is not obliged to be a legal filename, and
+  refusing to fetch `ES:FUT` over how its file would be named would be absurd.
 - **A corrupt batch file is removed before the client is asked for it again.** The
   client skips any file whose size already matches the manifest, without reading it, so
   a same-size corrupt file would otherwise fail verification on every retry forever

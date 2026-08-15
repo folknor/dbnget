@@ -167,41 +167,47 @@ fn same_instant(left: OffsetDateTime, right: OffsetDateTime) -> bool {
 /// `ESM4 NQM4` selects, and the vendor is free to echo back either form; leaving the
 /// repeat in would fail the match and re-buy data the account already owns.
 fn same_symbols(left: &Symbols, right: &Symbols) -> bool {
-    /// The sentinel meaning "every symbol in the dataset".
-    const ALL: &str = "ALL_SYMBOLS";
+    canonical_symbols(left) == canonical_symbols(right)
+}
 
-    /// One selection reduced to a comparable form.
-    ///
-    /// `Symbols::All` becomes the sentinel spelled out, because that is how it comes
-    /// back. The vendor echoes symbols as a JSON array, and the client only maps a
-    /// SCALAR `"ALL_SYMBOLS"` string to `Symbols::All` - an array containing it
-    /// deserializes as an ordinary one-element list. Comparing the variants directly
-    /// therefore never matched a whole-dataset job against the request that bought it,
-    /// which is the single most expensive thing this function could get wrong.
-    fn canonical(symbols: &Symbols) -> Result<Vec<String>, Vec<u32>> {
-        match symbols {
-            Symbols::All => Ok(vec![ALL.to_owned()]),
-            Symbols::Symbols(list) => {
-                let mut out: Vec<String> = list
-                    .iter()
-                    .flat_map(|s| s.split(','))
-                    .map(|s| s.trim().to_uppercase())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                out.sort_unstable();
-                out.dedup();
-                Ok(out)
-            }
-            Symbols::Ids(list) => {
-                let mut out = list.clone();
-                out.sort_unstable();
-                out.dedup();
-                Err(out)
-            }
+/// The sentinel meaning "every symbol in the dataset".
+pub const ALL_SYMBOLS: &str = "ALL_SYMBOLS";
+
+/// One symbol selection reduced to a comparable form: sorted, uppercased, deduplicated,
+/// and split on the commas the vendor may have joined it with.
+///
+/// `Symbols::All` becomes the sentinel spelled out, because that is how it comes back.
+/// The vendor echoes symbols as a JSON array, and the client only maps a SCALAR
+/// `"ALL_SYMBOLS"` string to `Symbols::All` - an array containing it deserializes as an
+/// ordinary one-element list. Comparing the variants directly therefore never matched a
+/// whole-dataset job against the request that bought it, which is the single most
+/// expensive thing this comparison could get wrong.
+///
+/// Shared with the `--immediate` filename key rather than kept private to matching. Two
+/// requests that adoption calls the same request must produce the same file name, and
+/// two it calls different must not collide - one definition of "same selection" is the
+/// only way that holds.
+pub fn canonical_symbols(symbols: &Symbols) -> Result<Vec<String>, Vec<u32>> {
+    match symbols {
+        Symbols::All => Ok(vec![ALL_SYMBOLS.to_owned()]),
+        Symbols::Symbols(list) => {
+            let mut out: Vec<String> = list
+                .iter()
+                .flat_map(|s| s.split(','))
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            out.sort_unstable();
+            out.dedup();
+            Ok(out)
+        }
+        Symbols::Ids(list) => {
+            let mut out = list.clone();
+            out.sort_unstable();
+            out.dedup();
+            Err(out)
         }
     }
-
-    canonical(left) == canonical(right)
 }
 
 /// Downloads a finished job into `out/JOB_ID/` and verifies every file against the

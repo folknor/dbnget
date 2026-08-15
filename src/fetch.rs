@@ -20,6 +20,7 @@ use databento::{
         timeseries::GetRangeParams,
     },
 };
+use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 use tracing::{debug, info, warn};
 
@@ -442,12 +443,19 @@ impl Request {
             .build()
     }
 
-    /// Names an `--immediate` file after the query it holds, both bounds included, so
-    /// a directory of them stays self-describing.
+    /// Names an `--immediate` file after the query it holds, so a directory of them
+    /// stays self-describing and no two different requests can land on one path.
     ///
-    /// The stamps carry seconds, and sub-second bounds carry their nanoseconds too:
-    /// minute precision let two differently-priced RFC 3339 requests land on one name,
-    /// and the second one to run would silently replace the first.
+    /// The name carries dataset, schema, a symbol hint, both bounds and an identity
+    /// key. The stamps carry seconds, and sub-second bounds carry their nanoseconds
+    /// too: minute precision let two differently-priced RFC 3339 requests land on one
+    /// name, and the second one to run would silently replace the first.
+    ///
+    /// The symbol hint is a convenience and the KEY is the identity. The hint is
+    /// sanitized rather than validated, because a symbol is not required to be a legal
+    /// filename - a colon is illegal on Windows and perfectly ordinary in a symbol -
+    /// and refusing to fetch `ES:FUT` because of how its file would be named would be
+    /// absurd. Anything the hint cannot represent is still separated by the key.
     ///
     /// The result is validated as a plain file name rather than trusted. `dataset` is
     /// a free-form string from the command line, and it is being joined onto
@@ -457,12 +465,112 @@ impl Request {
         let dataset = self.dataset.replace('.', "_");
         let start = stamp(self.range.start);
         let end = stamp(self.range.end);
-        let name = format!("{dataset}.{}.{start}-{end}.dbn.zst", self.schema);
+        let name = format!(
+            "{dataset}.{schema}.{hint}.{start}-{end}.{key}.dbn.zst",
+            schema = self.schema,
+            hint = self.symbol_hint(),
+            key = self.identity_key(),
+        );
         verify::checked_file_name(&name)
             .with_context(|| format!("`{}` does not make a usable file name", self.dataset))?;
         Ok(PathBuf::from(name))
     }
+
+    /// A short digest of everything that makes this request the request it is.
+    ///
+    /// Without it the name was dataset, schema and range - so AAPL and MSFT over one
+    /// window shared a path. The second request found the first one's file sitting
+    /// there and reported it as data already paid for: follow that advice and you
+    /// discard the AAPL data, ignore it and `-o` never yields MSFT, and script it and
+    /// you get a nonzero exit over a file holding the wrong instrument entirely.
+    ///
+    /// The fields are the ones adoption matches on, because those are by definition the
+    /// ones that change the bytes delivered - symbols, symbology in and out, bounds and
+    /// limit, alongside the dataset and schema already in the name. Encoding is fixed:
+    /// `--immediate` refuses anything but DBN. It is hashed rather than spelled out
+    /// because a hundred-symbol request has no short readable spelling, and a name that
+    /// is sometimes too long for the filesystem is a worse failure than an opaque one.
+    ///
+    /// Truncated to 16 hex characters. This separates requests; it does not defend
+    /// against anyone constructing a collision, and nothing downstream trusts it.
+    fn identity_key(&self) -> String {
+        let symbols = match jobs::canonical_symbols(&self.symbols) {
+            Ok(names) => names.join(","),
+            Err(ids) => ids.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
+        };
+        // Newline-separated with the field count fixed, so no field's contents can be
+        // read as another field's - a symbol containing the separator would otherwise
+        // let two different requests hash identically.
+        let identity = format!(
+            "{dataset}\n{schema}\n{symbols}\n{start}\n{end}\n{stype_in}\n{stype_out}\n{limit}\n{encoding}",
+            dataset = self.dataset,
+            schema = self.schema,
+            start = self.range.start.unix_timestamp_nanos(),
+            end = self.range.end.unix_timestamp_nanos(),
+            stype_in = self.stype_in,
+            stype_out = self.stype_out,
+            limit = self.limit.map_or(0, std::num::NonZeroU64::get),
+            encoding = self.encoding,
+        );
+        let digest = Sha256::digest(identity.as_bytes());
+        digest
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// A readable gesture at the symbols, for the human reading the directory.
+    ///
+    /// Reduced to the same canonical selection adoption compares, so the hint does not
+    /// change when the same request is spelled differently. Characters that cannot
+    /// safely sit in a file name are replaced rather than refused, and a long list is
+    /// truncated with a count - the identity key is what actually distinguishes the
+    /// file, so the hint is free to be lossy.
+    fn symbol_hint(&self) -> String {
+        let names: Vec<String> = match jobs::canonical_symbols(&self.symbols) {
+            Ok(names) => names,
+            Err(ids) => ids.iter().map(u32::to_string).collect(),
+        };
+        if names.is_empty() {
+            return "none".to_owned();
+        }
+
+        let safe = |name: &str| -> String {
+            name.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect()
+        };
+
+        let mut out = String::new();
+        let mut shown = 0;
+        for name in &names {
+            let cleaned = safe(name);
+            if !out.is_empty() && out.len() + cleaned.len() + 1 > HINT_WIDTH {
+                break;
+            }
+            if !out.is_empty() {
+                out.push('_');
+            }
+            out.push_str(&cleaned);
+            shown += 1;
+        }
+        if shown < names.len() {
+            out.push_str(&format!("+{}", names.len() - shown));
+        }
+        // A selection whose every character was unrepresentable still needs a stem that
+        // is not empty and not a leading dot.
+        if out.trim_matches('-').is_empty() {
+            return format!("symbols{out}");
+        }
+        out
+    }
 }
+
+/// How much of the symbol list a file name carries before it summarises the rest. Long
+/// enough to recognise a handful of tickers, short enough to leave room for the rest of
+/// the name inside a filesystem's limit.
+const HINT_WIDTH: usize = 24;
 
 /// A bound as a sortable stamp, to whatever precision it actually carries.
 fn stamp(instant: OffsetDateTime) -> String {
@@ -503,8 +611,101 @@ mod tests {
     fn immediate_file_names_carry_both_bounds() {
         assert_eq!(
             request().file_name().unwrap().to_str().unwrap(),
-            "GLBX_MDP3.trades.20240430T220000-20240501T210000.dbn.zst"
+            "GLBX_MDP3.trades.ESM4.20240430T220000-20240501T210000.8813bcf0dd200097.dbn.zst"
         );
+    }
+
+    /// The reported bug: the name held dataset, schema and range only, so two symbols
+    /// over one window shared a path. The second request was then told the first's file
+    /// was data it had already paid for - advice that destroys the first instrument's
+    /// data if followed and never yields the second if ignored.
+    #[test]
+    fn different_symbols_do_not_share_a_file_name() {
+        let mut aapl = request();
+        aapl.symbols = databento::Symbols::Symbols(vec!["AAPL".to_owned()]);
+        let mut msft = request();
+        msft.symbols = databento::Symbols::Symbols(vec!["MSFT".to_owned()]);
+        assert_ne!(aapl.file_name().unwrap(), msft.file_name().unwrap());
+
+        // And the whole-dataset request is not any one symbol's file either.
+        let mut all = request();
+        all.symbols = databento::Symbols::All;
+        assert_ne!(all.file_name().unwrap(), aapl.file_name().unwrap());
+    }
+
+    /// Every field adoption matches on changes the bytes delivered, so every one of
+    /// them has to change the name. `--stype-in` especially: `ES.FUT` is one instrument
+    /// as a raw symbol and every ES future as a parent.
+    #[test]
+    fn every_request_defining_field_changes_the_file_name() {
+        let baseline = request().file_name().unwrap();
+
+        let mut stype_in = request();
+        stype_in.stype_in = SType::Parent;
+        assert_ne!(stype_in.file_name().unwrap(), baseline, "stype_in");
+
+        let mut stype_out = request();
+        stype_out.stype_out = SType::RawSymbol;
+        assert_ne!(stype_out.file_name().unwrap(), baseline, "stype_out");
+
+        let mut limit = request();
+        limit.limit = std::num::NonZeroU64::new(1_000);
+        assert_ne!(limit.file_name().unwrap(), baseline, "limit");
+
+        let mut dataset = request();
+        "XNAS.ITCH".clone_into(&mut dataset.dataset);
+        assert_ne!(dataset.file_name().unwrap(), baseline, "dataset");
+
+        let mut schema = request();
+        schema.schema = Schema::Mbo;
+        assert_ne!(schema.file_name().unwrap(), baseline, "schema");
+    }
+
+    /// The same request spelled differently is the same request - adoption says so, and
+    /// the file name has to agree or a re-run writes a second copy beside the first.
+    #[test]
+    fn the_same_request_spelled_differently_names_one_file() {
+        let mut once = request();
+        once.symbols = databento::Symbols::Symbols(vec!["esm4".to_owned(), "NQM4".to_owned()]);
+        let mut again = request();
+        again.symbols = databento::Symbols::Symbols(vec![
+            "NQM4".to_owned(),
+            "ESM4".to_owned(),
+            "nqm4".to_owned(),
+        ]);
+        assert_eq!(once.file_name().unwrap(), again.file_name().unwrap());
+    }
+
+    /// A symbol is not obliged to be a legal file name. Refusing to fetch one because
+    /// of how its file would be named would be absurd, so the hint is sanitized - and
+    /// two symbols that sanitize alike are still separated by the identity key.
+    #[test]
+    fn symbols_that_are_not_legal_file_names_are_still_fetchable() {
+        let mut colons = request();
+        colons.symbols = databento::Symbols::Symbols(vec!["ES:FUT".to_owned()]);
+        let name = colons.file_name().unwrap();
+        assert!(name.to_str().unwrap().contains("ES-FUT"), "{name:?}");
+
+        let mut slashes = request();
+        slashes.symbols = databento::Symbols::Symbols(vec!["ES/FUT".to_owned()]);
+        assert_ne!(slashes.file_name().unwrap(), name);
+    }
+
+    /// A long list cannot go in the name in full, so it is truncated with a count and
+    /// the identity key carries the difference.
+    #[test]
+    fn a_long_symbol_list_is_summarised_but_still_distinct() {
+        let many: Vec<String> = (0..40).map(|i| format!("SYM{i:02}")).collect();
+        let mut first = request();
+        first.symbols = databento::Symbols::Symbols(many.clone());
+        let mut second = request();
+        second.symbols = databento::Symbols::Symbols(many[1..].to_vec());
+
+        let name = first.file_name().unwrap();
+        let rendered = name.to_str().unwrap();
+        assert!(rendered.contains('+'), "{rendered} should count the rest");
+        assert!(rendered.len() < 120, "{rendered} is too long");
+        assert_ne!(name, second.file_name().unwrap());
     }
 
     /// Two requests that differ only below the minute must not name the same file: the
