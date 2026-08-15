@@ -6,8 +6,11 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use databento::{
     HistoricalClient, Symbols,
-    dbn::Encoding,
-    historical::batch::{BatchJob, DownloadParams, JobState, ListJobsParams, SubmitJobParams},
+    dbn::{Compression, Encoding},
+    historical::batch::{
+        BatchJob, Delivery, DownloadParams, JobState, ListJobsParams, SplitDuration,
+        SubmitJobParams,
+    },
 };
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 use tracing::{info, warn};
@@ -116,6 +119,16 @@ fn state_rank(state: JobState) -> u8 {
     }
 }
 
+/// The output-shaping values dbnget always submits, and never offers a flag for.
+///
+/// They live here, next to the matching and listing that read them, rather than at the
+/// submission that sets them. The listing marks a job that differs from these, so if the
+/// submission changed and these did not, every job dbnget made would be flagged as
+/// unusual - the drift would be silent and in the direction of noise.
+pub const SUBMITTED_COMPRESSION: Compression = Compression::Zstd;
+/// See [`SUBMITTED_COMPRESSION`].
+pub const SUBMITTED_SPLIT_DURATION: SplitDuration = SplitDuration::Day;
+
 /// Whether an existing job would deliver the same bytes this submission would buy.
 ///
 /// Both the selection and the output format have to agree. A job covering the right
@@ -148,7 +161,7 @@ fn job_matches(job: &BatchJob, params: &SubmitJobParams) -> bool {
 fn effective_map_symbols(params: &SubmitJobParams) -> bool {
     params
         .map_symbols
-        .unwrap_or(matches!(params.encoding, Encoding::Csv | Encoding::Json))
+        .unwrap_or_else(|| text_encoding_default(params.encoding))
 }
 
 fn same_instant(left: OffsetDateTime, right: OffsetDateTime) -> bool {
@@ -452,7 +465,52 @@ fn shape(job: &BatchJob) -> String {
     if let Some(limit) = job.limit {
         out.push_str(&format!(" limit:{limit}"));
     }
+
+    // Everything below is shown ONLY when it differs from what dbnget submits. These
+    // are the remaining fields adoption compares, and dbnget cannot produce a job that
+    // varies in any of them - but the vendor's web UI can, and such a job was
+    // indistinguishable from an adoptable one while quietly refusing to be adopted.
+    // Printing them unconditionally would add eight columns that read identically on
+    // every row a user of this tool ever created, so the unusual is what earns the ink.
+    if job.compression != SUBMITTED_COMPRESSION {
+        out.push_str(&format!(" compression:{}", job.compression));
+    }
+    if job.split_duration != SUBMITTED_SPLIT_DURATION {
+        out.push_str(&format!(" split:{}", spelled(job.split_duration)));
+    }
+    if let Some(size) = job.split_size {
+        out.push_str(&format!(" splitsize:{}", human_bytes(size.get())));
+    }
+    if job.split_symbols {
+        out.push_str(" split_symbols");
+    }
+    if job.delivery != Delivery::Download {
+        out.push_str(&format!(" delivery:{}", spelled(job.delivery)));
+    }
+    if job.pretty_px {
+        out.push_str(" pretty_px");
+    }
+    if job.pretty_ts {
+        out.push_str(" pretty_ts");
+    }
+    // `map_symbols` has no fixed value to compare against: the vendor's default depends
+    // on the encoding, so what counts as unusual does too.
+    if job.map_symbols != text_encoding_default(job.encoding) {
+        out.push_str(&format!(" map_symbols:{}", job.map_symbols));
+    }
     out
+}
+
+/// A `Debug`-only vendor enum as a lower-case word. `Compression` and `Encoding`
+/// implement `Display`; `SplitDuration` and `Delivery` do not.
+fn spelled(value: impl std::fmt::Debug) -> String {
+    format!("{value:?}").to_lowercase()
+}
+
+/// The `map_symbols` the vendor applies when a submission does not ask: text encodings
+/// get the symbol column, DBN does not.
+fn text_encoding_default(encoding: Encoding) -> bool {
+    matches!(encoding, Encoding::Csv | Encoding::Json)
 }
 
 /// The symbols a job covers, qualified by the symbology they are written in.
@@ -820,6 +878,66 @@ mod tests {
         // field that decides whether either can be adopted.
         let raw = job_from(&params(|p| p.stype_out = SType::RawSymbol));
         assert_ne!(shape(&raw), shape(&plain));
+    }
+
+    /// A job dbnget submitted cannot vary in the remaining matched fields, so its row
+    /// stays quiet. Marking them unconditionally would put eight identical columns on
+    /// every row a user of this tool ever produced.
+    #[test]
+    fn a_job_dbnget_submitted_carries_no_unusual_markers() {
+        let shown = shape(&job_from(&params(|_| {})));
+        for noise in [
+            "compression:",
+            "split:",
+            "splitsize:",
+            "split_symbols",
+            "delivery:",
+            "pretty_px",
+            "pretty_ts",
+            "map_symbols:",
+        ] {
+            assert!(!shown.contains(noise), "{shown} should not mention {noise}");
+        }
+    }
+
+    /// The case the markers exist for: a job made in the vendor's web UI, which dbnget
+    /// will refuse to adopt for reasons that were previously invisible on the row.
+    #[test]
+    fn a_job_dbnget_could_not_have_made_says_so() {
+        let job = job_from(&params(|p| {
+            p.compression = Compression::None;
+            p.split_duration = SplitDuration::Week;
+            p.pretty_px = true;
+            p.pretty_ts = true;
+            p.split_symbols = true;
+            p.split_size = NonZeroU64::new(1_073_741_824);
+        }));
+        let shown = shape(&job);
+        assert!(shown.contains("compression:none"), "{shown}");
+        assert!(shown.contains("split:week"), "{shown}");
+        assert!(shown.contains("splitsize:1.0 GiB"), "{shown}");
+        assert!(shown.contains("split_symbols"), "{shown}");
+        assert!(shown.contains("pretty_px"), "{shown}");
+        assert!(shown.contains("pretty_ts"), "{shown}");
+
+        // And it genuinely is not adoptable, which is what the row is explaining.
+        assert!(!job_matches(&job, &params(|_| {})));
+    }
+
+    /// `map_symbols` has no fixed value to compare against, so "unusual" is relative to
+    /// the encoding: a CSV job with the symbol column is ordinary, a DBN one is not.
+    #[test]
+    fn map_symbols_is_marked_against_its_encoding_default() {
+        let ordinary_csv = job_from(&params(|p| p.encoding = Encoding::Csv));
+        assert!(!shape(&ordinary_csv).contains("map_symbols"));
+
+        let mut odd_dbn = job_from(&params(|_| {}));
+        odd_dbn.map_symbols = true;
+        assert!(shape(&odd_dbn).contains("map_symbols:true"));
+
+        let mut odd_csv = job_from(&params(|p| p.encoding = Encoding::Csv));
+        odd_csv.map_symbols = false;
+        assert!(shape(&odd_csv).contains("map_symbols:false"));
     }
 
     /// Adoption compares nanosecond instants, so a listing that stops at whole seconds

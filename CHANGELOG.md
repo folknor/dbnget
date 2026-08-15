@@ -10,84 +10,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `dbnget get JOB_ID` downloads a finished batch job by id, with the same manifest
-  verification adoption uses. Reconciliation only adopts a job when the command
-  reproduces the original request exactly, which left jobs whose command was lost with
-  no way to retrieve data the account had already bought.
-- `dbnget list` shows each job's encoding, output symbology and record limit. All are
-  part of what a request must match to adopt a job, and none were visible.
-- `dbnget list` gains a header row and a `DOWNLOAD` column. The size shown was the
-  uncompressed data size, which overstates a compressed DBN download by 4-5x; the
-  delivered package size now sits beside it, and both are labelled.
-- `dbnget dataset CODE` shows per-schema unit prices. Two datasets carrying the same
-  symbol can differ several-fold - `ohlcv-1m` is $12.00 per unit on EQUS.MINI and
-  $35.00 on DBEQ.BASIC - and nothing in the tool hinted at it.
-- `--cost` reports whether the spend gate would let the request through, naming the
-  smallest `--spend` value that would be accepted. With `--immediate` it also prints
-  the path it would write.
-- Every fetch run states whether it is streaming or reconciling against the account's
-  batch jobs. The two differ in billing and latency and nothing said which you got.
-
-- Interrupted downloads resume. A file shorter than the manifest is now continued from
-  where it stopped rather than deleted and fetched again from zero, which on a
-  multi-gigabyte job could mean never completing. A file of the right length that fails
-  its checksum is still discarded, since the client would otherwise skip it unread.
-- A download holds an exclusive lock on `OUT/JOB_ID/`. Concurrent runs previously both
-  wrote into the same directory, and the client writes straight to the final path with
-  no temporary file, so their writes could interleave. A run that finds the directory
-  held reports it and exits 3 instead of waiting. The lock is released by the operating
-  system when the process ends, so an interrupted download never leaves one stuck.
+  verification adoption uses - the way back to paid data when the original command
+  is lost.
+- `dbnget list` gains a header row and shows everything adoption matches on:
+  encoding, output symbology, record limit, intraday times and fractional seconds
+  in bounds, and a labelled `DOWNLOAD` (package) size beside the uncompressed data
+  size. Jobs whose compression, splitting, delivery or pretty/mapping options
+  differ from what dbnget submits are marked.
+- `dbnget dataset CODE` shows per-schema unit prices.
+- `--cost` reports whether the spend gate would accept the request, naming the
+  smallest `--spend` that would; with `--immediate` it also prints the output path.
+- Every fetch run states whether it is streaming or reconciling against the
+  account's batch jobs.
+- Bounds with sub-microsecond precision warn that the vendor may not echo them
+  exactly, which would stop a re-run from recognising the job it bought.
+- Interrupted downloads resume from where they stopped instead of restarting from
+  zero. A right-length file that fails its checksum is still discarded.
+- A download holds an exclusive lock on `OUT/JOB_ID/`; a concurrent run reports it
+  and exits 3. The lock is released by the OS when the process ends, so it can
+  never go stale.
 
 ### Fixed
 
-- Prices are printed so that the figure shown is never lower than the real price and is
-  always itself an acceptable `--spend` value. Rounding to the nearest cent broke both:
-  `--spend 0` against a request quoted at $0.000479 refused with "quoted $0.00 exceeds
-  the --spend cap of $0.00", and above a cent a true $0.0105 printed as `$0.01`, was
-  refused by a $0.01 cap that accepted a genuine $0.01, and suggested a whole-cent
-  `0.02` - twice the cap the request needed. Prices now print at the shortest precision
-  that reproduces them, rounding up when none does, and the suggested cap is that same
-  figure. The gate's comparison is unchanged and still exact.
-- `dbnget list` shows each job's output symbology and any fractional seconds in its
-  bounds. Adoption matches on both, so two jobs that the listing rendered identically
-  could differ in the field explaining why neither was adopted.
-- `--immediate` releases the destination claim when the `.part` claim fails. A run that
-  charged nothing could strand an empty file at the final name, which the next attempt
-  then refused.
-- `dbnget list` shows a job's times when its bounds are not midnight-aligned. An
-  intraday job printed as `2022-06-10..2022-06-10` was indistinguishable from a
-  whole-day job with an inclusive end.
-- `--immediate` releases both output claims when the spend gate refuses the run.
-  A refusal charged nothing but left an empty destination and `.part` file behind, so
-  the next attempt failed with "already exists ... rather than paying for it again"
-  about data that was never bought.
-
-- Spend refusals name the smallest `--spend` value that would be accepted, and mention
-  that a matching job already on the account is adopted rather than re-bought. Adoption was previously documented only
-  inside the help for the positional symbols argument.
-- `--immediate` output filenames key on the whole request, not just dataset, schema and
-  range. Two symbols fetched over one window previously shared a path, and the second
-  request was told the first's file was data it had already paid for: following that
-  advice discards the first instrument's data, ignoring it never yields the second, and
-  under a script it exits nonzero over a file holding the wrong instrument. Names now
-  carry a symbol segment and a digest of the fields adoption matches on - symbols,
-  symbology in and out, bounds and limit - so different requests get different files
-  and two spellings of one request still get the same file. **Existing `--immediate`
-  files keep their old names; nothing reads them back, but a re-run writes to the new
-  name rather than recognising the old one.**
-- `--immediate` distinguishes an abandoned zero-byte claim from a file holding data.
-  The old message told users they had already paid for what was an empty husk left by
-  a refused run.
+- Prices print at the shortest precision that reproduces them exactly, rounding up
+  otherwise, so the printed figure is never below the real price and is always
+  itself an acceptable `--spend`. Nearest-cent rounding could refuse with "quoted
+  $0.00 exceeds the --spend cap of $0.00" and suggest caps twice what was needed.
+- Spend refusals name the smallest `--spend` that would be accepted, and mention
+  that a matching job on the account is adopted rather than re-bought.
+- `--immediate` output filenames key on the whole request - symbols, symbology in
+  and out, bounds, limit - not just dataset, schema and range, so two different
+  requests can no longer collide on one path and be mistaken for already-paid
+  data. **Existing files keep their old names; a re-run writes to the new name
+  rather than recognising the old one.**
+- `--immediate` releases both output claims when the spend gate refuses the run or
+  when the second claim fails, instead of stranding empty files that the next run
+  reported as data already paid for.
+- `--immediate` distinguishes an abandoned zero-byte claim from a file holding
+  data, and tells you to delete it rather than describing a payment that never
+  happened.
 
 ### Changed
 
-- `-vv` no longer enables the vendor client's logging; that moves to `-vvv`. Its spans
-  carry the entire client struct on every line, which came to 9.5 KB for a single
-  `--cost` run against 209 bytes of signal. The reconcile steps it was being read for
-  are now logged by dbnget directly.
-- `--spend`'s documentation no longer claims the default fetches what a subscription
-  covers. The cost endpoint prices requests with no reference to the account, so
-  covered data still quotes a list price and the $0.00 default refuses nearly
-  everything with records in it. The gate is unchanged; the description was wrong.
+- The vendor client's logging moves from `-vv` to `-vvv`; its spans carry the
+  whole client struct on every line. The reconcile steps it was being read for are
+  now logged by dbnget directly.
+- `--spend`'s documentation no longer claims the $0.00 default fetches what a
+  subscription covers - the cost endpoint quotes list price regardless of
+  coverage, so the default refuses nearly everything with records in it.
 
 ## [0.1.0] - 2026-08-13
 

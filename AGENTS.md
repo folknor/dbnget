@@ -116,13 +116,16 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   selection with the symbology it is WRITTEN in. Ranges carry nanoseconds when they have
   them, since adoption compares nanosecond instants and whole seconds would print
   `12:30:00.1` and `12:30:00.9` identically. A listing that cannot explain a non-match
-  sends people looking for bugs in the match key. The listing is still NOT complete:
-  `job_matches` also reads `compression`, `split_duration`, `split_size`,
-  `split_symbols`, `delivery`, `pretty_px` and `map_symbols`, and none of them appear.
-  dbnget submits fixed values for all of them, so a job it created cannot differ - but a
-  job created in the web UI can, and it renders identically to an adoptable one while
-  refusing to be adopted. Adding a field to `job_matches` without asking how a user
-  would SEE that field is how this defect keeps recurring. The same rule covers the two byte
+  sends people looking for bugs in the match key. THE RULE IS: if `job_matches` reads a
+  field, the listing can show it. The remaining seven - `compression`, `split_duration`,
+  `split_size`, `split_symbols`, `delivery`, `pretty_px`, `pretty_ts` and `map_symbols` -
+  are shown ONLY when they differ from what dbnget submits, because dbnget cannot
+  produce a job that varies in them and eight always-on columns would read identically
+  on every row it ever made. A web-UI job can vary, and used to look adoptable while
+  refusing to be. The submitted values live in `jobs.rs` as `SUBMITTED_COMPRESSION` and
+  `SUBMITTED_SPLIT_DURATION` and the submission imports them, so changing one cannot
+  silently flag every job dbnget creates as unusual. Adding a field to `job_matches`
+  without asking how a user would SEE it is how this defect kept recurring. The same rule covers the two byte
   counts: `actual_size` is uncompressed data and `package_size` is the download, they
   differ by 4-5x on compressed DBN and in the other direction on a handful of small
   text files, so one unlabelled number gets read as the download and is not it.

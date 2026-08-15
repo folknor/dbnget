@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use databento::{
     HistoricalClient,
-    dbn::{Compression, Encoding, SType, Schema},
+    dbn::{Encoding, SType, Schema},
     historical::{
         DateRange, DateTimeRange,
-        batch::{BatchJob, JobState, SplitDuration, SubmitJobParams},
+        batch::{BatchJob, JobState, SubmitJobParams},
         metadata::GetQueryParams,
         symbology::ResolveParams,
         timeseries::GetRangeParams,
@@ -76,6 +76,33 @@ fn validate(args: &FetchArgs) -> Result<Request> {
         limit: args.limit,
         encoding: args.format.into(),
     })
+}
+
+/// Warns about bounds carrying precision finer than a microsecond.
+///
+/// Adoption compares the request's bounds against the ones the vendor echoes back, to
+/// the nanosecond. The echo is parsed as ISO 8601 and today carries nine digits, so a
+/// nanosecond bound survives it - but the client's fallback parser stops at six, and
+/// nothing in the API promises a bound is echoed exactly as submitted. If one is ever
+/// rounded server-side, the job stops matching the command that bought it, and every
+/// re-run buys it again with no indication why.
+///
+/// A warning rather than a refusal: the request is legal, it prices correctly, and it
+/// very probably round-trips. What it cannot do is prove that, and a re-purchase is
+/// expensive enough to be worth a line of output. It only fires on bounds this precise,
+/// which is already unusual.
+///
+/// Belongs to the reconcile path alone. `--cost` buys nothing and `--immediate` involves
+/// no job to adopt, so warning there would describe a re-purchase that cannot happen -
+/// and a warning that does not apply teaches people to skip the ones that do.
+fn warn_on_sub_microsecond(range: &DateTimeRange) {
+    let finer_than_a_microsecond = |t: OffsetDateTime| !t.nanosecond().is_multiple_of(1_000);
+    if finer_than_a_microsecond(range.start) || finer_than_a_microsecond(range.end) {
+        warn!(
+            "these bounds carry sub-microsecond precision; if the vendor rounds them when echoing the job back, \
+             re-running this command will not recognise the job it bought and will buy it again"
+        );
+    }
 }
 
 /// `--cost`: price the request and stop. Never queues.
@@ -166,6 +193,7 @@ async fn reconcile(
     // the output distinguishes them - a user who left `--immediate` off could not tell
     // whether a job had been queued on the account.
     info!("batch mode: reconciling against the jobs on the account");
+    warn_on_sub_microsecond(&request.range);
 
     let params = request.submit_params();
     let listing = jobs::all(client).await?;
@@ -439,6 +467,10 @@ impl Request {
     /// The batch submission this request corresponds to. The non-negotiated fields
     /// (compression, split duration) are fixed so that every run of the same command
     /// builds the identical request, which is what adoption matches on.
+    ///
+    /// Those fixed values are named in `jobs`, beside the matching and listing that read
+    /// them: the listing flags a job differing from them as unusual, so setting one here
+    /// and comparing against another there would flag every job dbnget ever made.
     fn submit_params(&self) -> SubmitJobParams {
         SubmitJobParams::builder()
             .dataset(&self.dataset)
@@ -449,8 +481,8 @@ impl Request {
             .stype_out(self.stype_out)
             .maybe_limit(self.limit)
             .encoding(self.encoding)
-            .compression(Compression::Zstd)
-            .split_duration(SplitDuration::Day)
+            .compression(jobs::SUBMITTED_COMPRESSION)
+            .split_duration(jobs::SUBMITTED_SPLIT_DURATION)
             .build()
     }
 
