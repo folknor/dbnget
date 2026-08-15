@@ -13,7 +13,7 @@ use databento::{
     },
 };
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{Outcome, cli::ListArgs, lock, query, verify};
 
@@ -189,6 +189,17 @@ pub const ALL_SYMBOLS: &str = "ALL_SYMBOLS";
 /// One symbol selection reduced to a comparable form: sorted, uppercased, deduplicated,
 /// and split on the commas the vendor may have joined it with.
 ///
+/// Every variant reduces to STRINGS, including `Symbols::Ids`. The client's `Symbols` is
+/// an untagged enum, so a symbols echo of JSON numbers deserializes as `Ids` while this
+/// tool's request side only ever builds `Symbols` of strings - `query::symbols` has no
+/// path that produces `Ids`, whatever `--stype-in` says. Keeping ids in a separate,
+/// never-equal representation therefore meant that if the vendor echoed an
+/// instrument-id job numerically, the job could never match the command that bought it,
+/// and every re-run would buy it again. Numbers and their decimal spellings select the
+/// same instruments, and a job whose symbology differs is already excluded by
+/// `job_matches` comparing `stype_in`, so folding them together cannot create a false
+/// match either.
+///
 /// `Symbols::All` becomes the sentinel spelled out, because that is how it comes back.
 /// The vendor echoes symbols as a JSON array, and the client only maps a SCALAR
 /// `"ALL_SYMBOLS"` string to `Symbols::All` - an array containing it deserializes as an
@@ -199,26 +210,41 @@ pub const ALL_SYMBOLS: &str = "ALL_SYMBOLS";
 /// Shared with the `--immediate` filename key rather than kept private to matching. Two
 /// requests that adoption calls the same request must produce the same file name, and
 /// two it calls different must not collide - one definition of "same selection" is the
-/// only way that holds.
-pub fn canonical_symbols(symbols: &Symbols) -> Result<Vec<String>, Vec<u32>> {
-    match symbols {
-        Symbols::All => Ok(vec![ALL_SYMBOLS.to_owned()]),
-        Symbols::Symbols(list) => {
-            let mut out: Vec<String> = list
-                .iter()
-                .flat_map(|s| s.split(','))
-                .map(|s| s.trim().to_uppercase())
-                .filter(|s| !s.is_empty())
-                .collect();
-            out.sort_unstable();
-            out.dedup();
-            Ok(out)
-        }
-        Symbols::Ids(list) => {
-            let mut out = list.clone();
-            out.sort_unstable();
-            out.dedup();
-            Err(out)
+/// only way that holds. The ids split broke that too: `Ids([42])` and `Symbols(["42"])`
+/// were different selections to matching and the same file name to the key.
+///
+/// Sorting is lexical rather than numeric, which is fine because both sides of every
+/// comparison are sorted the same way; the order is a canonical form, not a ranking.
+pub fn canonical_symbols(symbols: &Symbols) -> Vec<String> {
+    let mut out: Vec<String> = match symbols {
+        Symbols::All => vec![ALL_SYMBOLS.to_owned()],
+        Symbols::Symbols(list) => list
+            .iter()
+            .flat_map(|s| s.split(','))
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Symbols::Ids(list) => list.iter().map(u32::to_string).collect(),
+    };
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// What state the account says a job is in, or `None` if it cannot be found out.
+///
+/// Advisory, and deliberately so: it exists to improve a message, never to decide
+/// whether to download. A listing that fails must not turn a working `dbnget get` into
+/// an error, so an unanswerable question leaves the caller's original diagnosis intact.
+async fn state_of(client: &mut HistoricalClient, job_id: &str) -> Option<JobState> {
+    match all(client).await {
+        Ok(jobs) => jobs
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .map(|job| job.state),
+        Err(err) => {
+            debug!(%err, "could not check the job's state");
+            None
         }
     }
 }
@@ -241,9 +267,32 @@ pub async fn download(client: &mut HistoricalClient, job_id: &str, out: &Path) -
         .await
         .with_context(|| format!("listing files for job {job_id}"))?;
     if manifest.is_empty() {
-        bail!(
-            "job {job_id} is done but delivered no files; it bought nothing, so there is nothing to verify"
-        );
+        // The adoption path reaches here only for a job it has already seen is Done, but
+        // `dbnget get` takes an id straight from the user and checks nothing. Asserting
+        // "is done" about a job that is still queued sends someone looking for a
+        // symbology mistake when the answer is to wait, so the state decides the message.
+        //
+        // Which state maps to which outcome matters more than the wording. Exit 3 is a
+        // promise that re-running will eventually settle, and a shell loop is expected to
+        // spin on it until it does. Only a job still being prepared can honour that. An
+        // EXPIRED job never becomes ready - its files are gone for good - so returning
+        // nonterminal for one would loop a script forever on a job that cannot arrive,
+        // while telling the user it is "not ready" as though waiting were the answer.
+        match state_of(client, job_id).await {
+            Some(JobState::Queued | JobState::Processing) => {
+                println!("{job_id} is still being prepared; re-run once it is done");
+                return Ok(Outcome::Nonterminal);
+            }
+            Some(JobState::Expired) => bail!(
+                "job {job_id} has expired; the vendor deletes a job's prepared files about 30 days \
+                 after completion, so this data can only be obtained by buying it again - re-run \
+                 the original fetch command to be quoted for it"
+            ),
+            // Done, or a state the listing could not tell us. Either way the job claims
+            // to be finished and delivered nothing, which is the original diagnosis.
+            Some(JobState::Done) | None => {}
+        }
+        bail!("job {job_id} delivered no files; it bought nothing, so there is nothing to verify");
     }
     for file in &manifest {
         verify::checked_file_name(&file.filename)?;
@@ -814,6 +863,27 @@ mod tests {
         // Still not the same as naming one instrument.
         let one = Symbols::Symbols(vec!["ESM4".to_owned()]);
         assert!(!same_symbols(&Symbols::All, &one));
+    }
+
+    /// The request side never builds `Symbols::Ids`, but the vendor's untagged enum
+    /// produces one from a numeric echo. Held in a separate representation, such a job
+    /// could never match the command that bought it - and every re-run would buy it
+    /// again.
+    #[test]
+    fn numeric_ids_match_the_symbols_that_bought_them() {
+        let echoed = Symbols::Ids(vec![12_345]);
+        let requested = Symbols::Symbols(vec!["12345".to_owned()]);
+        assert!(same_symbols(&echoed, &requested));
+        assert!(same_symbols(&requested, &echoed));
+
+        let several = Symbols::Ids(vec![7, 42, 7]);
+        let spelled = Symbols::Symbols(vec!["42".to_owned(), "7".to_owned()]);
+        assert!(same_symbols(&several, &spelled));
+
+        assert!(!same_symbols(
+            &echoed,
+            &Symbols::Symbols(vec!["999".to_owned()])
+        ));
     }
 
     #[test]

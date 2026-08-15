@@ -32,6 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Jobs whose symbols come back as numeric instrument ids now match the command that
+  bought them, instead of being re-purchased on every run. The same fix stops two
+  selections that adoption calls different - `42` and `"42"` - from sharing one
+  `--immediate` filename.
+- `--immediate` no longer warns that streaming is billed above the quote it was gated
+  on. Measured against the API, `historical` and `historical-streaming` price a request
+  identically, so `--spend` is an exact ceiling on both paths.
+- `dbnget get` reports a job's actual state instead of claiming a finished job delivered
+  no files. A job still being prepared exits 3 so a poll loop waits for it; an expired
+  one is an error naming the 30-day file expiry, since waiting will never produce it.
+- `--cost --immediate --format csv` no longer prints a `.dbn.zst` path for a run that
+  would be refused for not being DBN.
+
 - Prices print at the shortest precision that reproduces them exactly, rounding up
   otherwise, so the printed figure is never below the real price and is always
   itself an acceptable `--spend`. Nearest-cent rounding could refuse with "quoted

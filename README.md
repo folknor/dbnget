@@ -187,10 +187,13 @@ convenience for reading the directory: it is sanitized rather than validated (a 
 is under no obligation to be a legal filename) and truncated with a count when the
 list is long; anything it blurs, the key still distinguishes.
 
-**The spend gate is weaker here.** The cost endpoint prices the batch feed mode only,
-so the quote `--spend` is checked against is a floor: streaming is a dearer feed mode
-and the actual charge is higher. dbnget says so on every `--immediate` run. Treat
-`--spend` as an approximate ceiling on this path and an exact one on the batch path.
+**The spend gate is exactly as strong here as on the batch path.** Earlier versions
+warned that the quote was only a floor, on the belief that streaming was a dearer feed
+mode the cost endpoint could not price. Measured against the API, both halves are wrong:
+the endpoint takes a feed-mode parameter, and `historical` and `historical-streaming`
+return the same figure for the same request. The per-schema unit prices agree too; only
+the `live` mode is dearer, and `--immediate` does not use it. `--spend` is an exact
+ceiling on both paths.
 
 Because the request is already billed by the time a byte arrives, an existing file at
 that name is an error rather than something to overwrite. Both the destination and its

@@ -99,7 +99,21 @@ fn rendering(usd: f64) -> Option<String> {
         let scale = scale_for(precision);
         let rounded_up = (usd * scale).ceil() / scale;
         let rendered = format!("{rounded_up:.precision$}");
-        (significant_digits(&rendered) >= 2).then_some(rendered)
+        if significant_digits(&rendered) < 2 {
+            return None;
+        }
+        // `ceil` rounds up, but the division after it rounds to NEAREST, so the result
+        // can in principle land a hair below `usd` - and this function's entire contract
+        // is that it never does. A rendering that understates would be printed as the
+        // price and offered as the cap that admits it, and the gate would refuse its own
+        // advice. Checked in release rather than asserted, because the whole point is a
+        // case too rare for a fixed spread of test values to find.
+        let understates = rendered.parse::<f64>().is_ok_and(|shown| shown < usd);
+        debug_assert!(!understates, "{rendered} understates {usd}");
+        if understates {
+            return None;
+        }
+        Some(rendered)
     })
 }
 

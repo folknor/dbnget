@@ -166,9 +166,16 @@ impl FetchArgs {
     /// Whether the user asked for nothing at all.
     ///
     /// `dbnget` on its own is someone finding out what the tool is, and answering that
-    /// with `--dataset is required` teaches them nothing. Only the request-defining
-    /// arguments count: a bare invocation that still carries `--key` or `-v` is the
-    /// same question.
+    /// with `--dataset is required` teaches them nothing. A bare invocation that still
+    /// carries `--key` or `-v` is the same question.
+    /// Only the request-defining arguments count. `--format`, `--stype-in/out` and
+    /// `--output` deliberately do NOT, even though a run carrying one is arguably
+    /// part-way through composing a command rather than asking what the tool is.
+    /// Counting them was tried and reverted: the API key is resolved before the request
+    /// is validated, so `dbnget --format csv` stopped printing the help and started
+    /// demanding a key instead of naming the flag it still needs - a lateral move, not
+    /// a fix. Making it name the flag means validating the request before building the
+    /// client, which is the change to make if this is revisited.
     pub fn is_bare(&self) -> bool {
         self.symbols.is_empty()
             && self.dataset.is_none()

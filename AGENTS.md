@@ -27,6 +27,16 @@ adopt the existing job instead of buying the same data a second time, so ANY cha
 how a request is normalized into a match key is a change to whether users get
 double-charged. Bounds normalize to UTC instants for exactly this reason.
 
+Symbol REPRESENTATION is where that matching goes wrong, twice over. The client's
+`Symbols` is an untagged enum, so what the vendor echoes decides which variant comes
+back, while `query::symbols` only ever builds `Symbols::Symbols` of strings - there is
+no input that produces `Symbols::Ids`. `canonical_symbols` therefore reduces EVERY
+variant to strings, ids included: holding ids in a separate, never-equal form meant a
+numerically-echoed job could never match the command that bought it, and it also gave
+`Ids([42])` and `Symbols(["42"])` one `--immediate` file name while matching called them
+different requests. Folding them cannot create a false match, because a job in another
+symbology is already excluded by `stype_in`.
+
 `ALL_SYMBOLS` is the trap with the largest bill attached. The vendor echoes symbols as
 a JSON array, and the client maps only a SCALAR `"ALL_SYMBOLS"` string to
 `Symbols::All`, so a whole-dataset job comes back as an ordinary one-element list.
@@ -226,6 +236,13 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   delivers no CSV or JSON - and it bills the moment the request is issued. It has no
   session splitting, resume, or empty-day pre-pass; that machinery existed when
   streaming was primary, and with batch as the default the vendor does the splitting.
+- **Streaming is NOT priced above batch, and the gate is not weaker there.** This was
+  asserted in the docs and warned about on every `--immediate` run, and it is false.
+  Measured 2026-08-15: `metadata.get_cost` takes a `mode` parameter, and `historical`
+  and `historical-streaming` both return `0.000479400158` for a day of XNAS.ITCH
+  `ohlcv-1m` on MSFT; `metadata.list_unit_prices` matches schema for schema across
+  GLBX.MDP3, EQUS.MINI and DBEQ.BASIC. Only `live` is dearer (about 20%), and
+  `--immediate` does not use it. Re-measure before reinstating any claim of the sort.
 
 ### Known gaps (documented, not bugs to "fix" silently)
 

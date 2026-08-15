@@ -128,11 +128,22 @@ async fn cost(
     // Only on the streaming path is there a name to print. A batch job lands in
     // `OUTPUT/JOB_ID/`, and the job id does not exist until the job is submitted, so
     // anything printed here would be an invention.
+    //
+    // The encoding check comes first because the file name hardcodes `.dbn.zst`:
+    // `--cost --immediate --format csv` would otherwise promise a path that the run it
+    // is pricing refuses outright, which is the same "priced it, then it refused" trap
+    // `--cost` exists to close.
     if args.immediate {
-        println!(
-            "would write:   {}",
-            args.output.join(request.file_name()?).display()
-        );
+        if request.encoding == Encoding::Dbn {
+            println!(
+                "would write:   {}",
+                args.output.join(request.file_name()?).display()
+            );
+        } else {
+            println!(
+                "would write:   nothing - --immediate delivers DBN only, so this run would be refused"
+            );
+        }
     }
 
     if quote.is_empty() {
@@ -347,14 +358,22 @@ async fn immediate(
         }
     };
 
-    // The cost endpoint prices the default feed mode, which is the batch one, and it
-    // takes no mode parameter to ask otherwise. Streaming is a different, dearer feed
-    // mode, so this quote is a floor rather than the bill. Said out loud because the
-    // gate's whole promise is that nothing is charged beyond what was approved, and on
-    // this path that promise is weaker than on the batch path.
-    warn!(
+    // This used to warn that the quote was a floor, on the belief that streaming was a
+    // dearer feed mode than batch and that the cost endpoint could only price the
+    // latter. Measured on 2026-08-15, both halves are wrong: the endpoint takes a
+    // `mode` parameter, and `historical` and `historical-streaming` return the SAME
+    // number for the same request - 0.000479400158 for a day of XNAS.ITCH ohlcv-1m on
+    // MSFT under both. `metadata.list_unit_prices` agrees schema for schema across
+    // GLBX.MDP3, EQUS.MINI and DBEQ.BASIC. Only `live` is dearer, and `--immediate`
+    // does not use it.
+    //
+    // So the gate is exactly as strong here as on the batch path, and the warning was
+    // telling users their approved cap might not hold when it does. Removing it matters
+    // more than leaving a harmless caution: a warning that fires on every run and
+    // overstates the risk is how people learn to ignore the ones that do not.
+    debug!(
         quoted = spend::money(quote.usd),
-        "--immediate is gated on the batch price; streaming is billed at the streaming rate, which is higher"
+        "streaming is priced identically to batch for this request"
     );
 
     // The handles have done their job: the names are taken, and holding an open file is
@@ -537,10 +556,7 @@ impl Request {
     /// Truncated to 16 hex characters. This separates requests; it does not defend
     /// against anyone constructing a collision, and nothing downstream trusts it.
     fn identity_key(&self) -> String {
-        let symbols = match jobs::canonical_symbols(&self.symbols) {
-            Ok(names) => names.join(","),
-            Err(ids) => ids.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
-        };
+        let symbols = jobs::canonical_symbols(&self.symbols).join(",");
         // Newline-separated with the field count fixed, so no field's contents can be
         // read as another field's - a symbol containing the separator would otherwise
         // let two different requests hash identically.
@@ -571,10 +587,7 @@ impl Request {
     /// truncated with a count - the identity key is what actually distinguishes the
     /// file, so the hint is free to be lossy.
     fn symbol_hint(&self) -> String {
-        let names: Vec<String> = match jobs::canonical_symbols(&self.symbols) {
-            Ok(names) => names,
-            Err(ids) => ids.iter().map(u32::to_string).collect(),
-        };
+        let names = jobs::canonical_symbols(&self.symbols);
         if names.is_empty() {
             return "none".to_owned();
         }
@@ -732,6 +745,22 @@ mod tests {
         let mut slashes = request();
         slashes.symbols = databento::Symbols::Symbols(vec!["ES/FUT".to_owned()]);
         assert_ne!(slashes.file_name().unwrap(), name);
+    }
+
+    /// The filename key and the match key have to agree about what "the same selection"
+    /// means. They disagreed for numeric ids: matching called `Ids([42])` and
+    /// `Symbols(["42"])` different requests while the key gave them one file name.
+    #[test]
+    fn numeric_ids_and_their_spellings_name_one_file() {
+        let mut ids = request();
+        ids.symbols = databento::Symbols::Ids(vec![42]);
+        let mut spelled = request();
+        spelled.symbols = databento::Symbols::Symbols(vec!["42".to_owned()]);
+        assert_eq!(ids.file_name().unwrap(), spelled.file_name().unwrap());
+
+        let mut other = request();
+        other.symbols = databento::Symbols::Ids(vec![43]);
+        assert_ne!(ids.file_name().unwrap(), other.file_name().unwrap());
     }
 
     /// A long list cannot go in the name in full, so it is truncated with a count and
