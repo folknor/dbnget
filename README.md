@@ -115,15 +115,31 @@ commands until none exits 3.
 
 ### The spend gate: `--spend`
 
-Without `--spend`, any request that would cost more than $0.00 is refused with the
-quoted price. Databento prices a request an active subscription already covers at
-exactly $0.00, so the default is "fetch only what I have already paid for":
+Without `--spend`, any request with a price above $0.00 is refused with the quote:
 
 ```
 $ dbnget ES.FUT --stype-in parent -d GLBX.MDP3 -s tbbo --start 2020-05-04 --end 2020-05-05
-Error: this request costs $0.79 (377685 records, 30214800 billable bytes, $0.79);
+Error: this request is priced at $0.79 (377685 records, 30214800 billable bytes, $0.79);
 pass --spend USD to approve the charge
 ```
+
+**What the cap is checked against is the vendor's list price, not your bill.** The cost
+endpoint prices a request with no reference to your account: data an active subscription
+covers quotes exactly the same as data nobody has paid for, and it answers in fractions
+of a cent. A day of one symbol's minute bars is priced at $0.00048, and the job it
+produces then shows `$0.00` on the account. So the $0.00 default refuses nearly every
+request that holds records, and prices below a cent are printed at the precision they
+need rather than rounded to `$0.00`:
+
+```
+$ dbnget MSFT -d XNAS.ITCH -s ohlcv-1m --start 2022-06-10 --spend 0
+Error: quoted $0.00048 exceeds the --spend cap of $0.00
+```
+
+There is deliberately no "only if it is free" mode. Nothing the API offers before a
+submit distinguishes "covered by a subscription" from "cheap", so such a flag would be
+guessing with your money - and rounding the comparison to cents would let a cap set to
+zero authorize a real charge. Price with `--cost`, then pass a cap at or above it.
 
 `--spend USD` caps what a run may charge. A quote above the cap refuses rather than
 truncating the request to fit; a non-finite quote is refused; and a request matching
@@ -145,8 +161,8 @@ dbnget ES.v.0 --stype-in continuous -d GLBX.MDP3 -s mbp-1 --start 2024-05-01 --e
 
 Prints the record count, billable size, USD cost and how the symbols resolve, then
 stops. Never queues, and the spend gate does not apply - it is a quote, not a purchase.
-A query matching no records says so, because a $0.00 quote means either "covered by a
-subscription" or "matches nothing" and only the record count tells them apart.
+A query matching no records says so, because only the record count tells an empty
+request apart from a cheap one.
 
 ```
 $ dbnget ES.FUT --stype-in parent -d GLBX.MDP3 -s tbbo --start 2022-06-01 --end 2022-06-30 --cost
@@ -183,7 +199,10 @@ Because the request is already billed by the time a byte arrives, an existing fi
 that name is an error rather than something to overwrite. Both the destination and its
 `.part` sibling are claimed exclusively before the request is priced or issued, so two
 concurrent runs of the same command cannot both pay, and a filesystem problem surfaces
-while the request is still free. The stream lands on the `.part` sibling and is renamed
+while the request is still free. A run that is then refused by the spend gate releases
+both claims on the way out: it charged nothing, so it must not leave behind two empty
+files that make the next run report the data as already paid for. The stream lands on
+the `.part` sibling and is renamed
 only once it completes - there is no manifest to verify an immediate download against,
 so a half-written file must never be left under the final name.
 
@@ -216,16 +235,40 @@ dbnget list datasets                  # the datasets the account can access
 
 Bare `list` lists jobs: ID, state, dataset, schema, symbols qualified by their
 symbology (`ES.FUT` is one instrument as a raw symbol and every ES future as a parent
-symbol), range, cost and size. It is the tool for checking what already exists before
-submitting - a widened `--end` is a new job that re-purchases the old range, and
-dbnget does not warn about overlaps.
+symbol), range, encoding and record limit, cost and size. It is the tool for checking
+what already exists before submitting - a widened `--end` is a new job that
+re-purchases the old range, and dbnget does not warn about overlaps.
 
 ```
-GLBX-20260812-MUCPBX5U6K  Done  GLBX.MDP3  tbbo    continuous:ES.v.0   2025-08-12..2025-08-31   $0.00  347.8 MiB
-GLBX-20260805-JUBCRPRLG8  Done  GLBX.MDP3  trades  continuous:NQ.v.0,MNQ.v.0  2026-07-05..2026-07-19  $24.06  1.8 GiB
+GLBX-20260812-MUCPBX5U6K  Done  GLBX.MDP3  tbbo    continuous:ES.v.0   2025-08-12..2025-08-31   dbn   $0.00  347.8 MiB
+XNAS-20260803-SU6U8HRT75  Done  XNAS.ITCH  ohlcv-1m  raw_symbol:MSFT   2022-06-10T12:30:00..2022-06-10T14:00:00  csv limit:1000   $0.00  8.1 KiB
 ```
+
+The columns after the range are the fields adoption matches on that are not otherwise
+visible. A job's bounds print as bare dates only when both fall on midnight; anything
+else shows its times, because an intraday job rendered as `2022-06-10..2022-06-10` reads
+like a whole-day job with an inclusive end, and comparing it against a whole-day request
+would suggest a match that will not happen. Encoding and `limit` are part of the same
+key: a CSV job capped at 1000 records is not a substitute for an uncapped DBN request
+over the same records.
 
 Long symbol lists are truncated with a count of what was left out.
+
+## `dbnget get JOB_ID` - download a job by name
+
+```sh
+dbnget get XNAS-20260803-SU6U8HRT75 -o data
+```
+
+Downloads a finished job into `OUTPUT/JOB_ID/` and verifies every file, exactly as
+adoption does. Reconciliation adopts a job only when the command reproduces the original
+request field for field, which is the right rule for deciding whether to spend money and
+a poor one for retrieving data already bought. When the original command is lost, this is
+the way back to the data - take the ID from `dbnget list`.
+
+Nothing on this path can charge: the job is already paid for and its files already
+prepared. Re-running it is free and idempotent, since a file that verifies against the
+manifest is kept rather than fetched again.
 
 ## `dbnget dataset` - one dataset's facts
 

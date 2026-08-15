@@ -5,6 +5,38 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `dbnget get JOB_ID` downloads a finished batch job by id, with the same manifest
+  verification adoption uses. Reconciliation only adopts a job when the command
+  reproduces the original request exactly, which left jobs whose command was lost with
+  no way to retrieve data the account had already bought.
+- `dbnget list` shows each job's encoding and record limit. Both are part of what a
+  request must match to adopt a job, and neither was visible.
+
+### Fixed
+
+- Prices below a cent are printed at the precision they need. `--spend 0` against a
+  request quoted at $0.000479 refused with "quoted $0.00 exceeds the --spend cap of
+  $0.00", which asserts that zero exceeds zero and gives no usable cap. It now reads
+  `quoted $0.00048`. The comparison is unchanged and still exact.
+- `dbnget list` shows a job's times when its bounds are not midnight-aligned. An
+  intraday job printed as `2022-06-10..2022-06-10` was indistinguishable from a
+  whole-day job with an inclusive end.
+- `--immediate` releases both output claims when the spend gate refuses the run.
+  A refusal charged nothing but left an empty destination and `.part` file behind, so
+  the next attempt failed with "already exists ... rather than paying for it again"
+  about data that was never bought.
+
+### Changed
+
+- `--spend`'s documentation no longer claims the default fetches what a subscription
+  covers. The cost endpoint prices requests with no reference to the account, so
+  covered data still quotes a list price and the $0.00 default refuses nearly
+  everything with records in it. The gate is unchanged; the description was wrong.
+
 ## [0.1.0] - 2026-08-13
 
 Initial release.

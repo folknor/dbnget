@@ -82,7 +82,7 @@ async fn cost(client: &mut HistoricalClient, request: &Request) -> Result<Outcom
     let quote = spend::fetch(client, &request.metadata_params()).await?;
     println!("records:       {}", quote.records);
     println!("billable size: {} bytes", quote.billable_bytes);
-    println!("cost:          ${:.2}", quote.usd);
+    println!("cost:          {}", spend::money(quote.usd));
 
     if let Some(summary) = resolve_summary(client, request).await {
         println!("symbols:       {summary}");
@@ -252,11 +252,25 @@ async fn immediate(
     // failure reachable here - the file exists, the directory is unwritable, a path
     // component is inaccessible - is a failure that must happen while the request is
     // still free.
-    let _claim = claim(&path)?;
-    let _partial_claim = claim(&partial)?;
+    let claimed = claim(&path)?;
+    let claimed_partial = claim(&partial)?;
 
-    let quote = spend::fetch(client, &request.metadata_params()).await?;
-    spend::approve(&quote, args.spend)?;
+    // Pricing and the gate come after the claims and before anything is billed, so a
+    // refusal here has spent nothing and written nothing - and the two empty files it
+    // would otherwise leave behind are pure damage. The next run finds the names taken
+    // and reports that the data was already paid for, which is the opposite of what
+    // happened: a free refusal would have permanently blocked the command it refused.
+    // Only claims this run made are released, and only while they are still empty.
+    let quote = match gate(client, args, request).await {
+        Ok(quote) => quote,
+        Err(err) => {
+            drop(claimed);
+            drop(claimed_partial);
+            release(&partial).await;
+            release(&path).await;
+            return Err(err);
+        }
+    };
 
     // The cost endpoint prices the default feed mode, which is the batch one, and it
     // takes no mode parameter to ask otherwise. Streaming is a different, dearer feed
@@ -264,9 +278,16 @@ async fn immediate(
     // gate's whole promise is that nothing is charged beyond what was approved, and on
     // this path that promise is weaker than on the batch path.
     warn!(
-        quoted = format!("${:.2}", quote.usd),
+        quoted = spend::money(quote.usd),
         "--immediate is gated on the batch price; streaming is billed at the streaming rate, which is higher"
     );
+
+    // The handles have done their job: the names are taken, and holding an open file is
+    // not what reserves them. Releasing them before the write keeps the rename from
+    // being a rename onto a file this process still has open, which the platforms this
+    // crate does not exclude do not allow.
+    drop(claimed);
+    drop(claimed_partial);
 
     info!(path = %path.display(), "streaming");
     let params = GetRangeParams::builder()
@@ -300,6 +321,20 @@ async fn immediate(
 
     println!("{}", path.display());
     Ok(Outcome::Settled)
+}
+
+/// Prices the request and puts it through the spend gate, as one fallible step.
+///
+/// Kept together so a caller holding output claims has a single error to unwind from,
+/// rather than two places where an early return could leak them.
+async fn gate(
+    client: &mut HistoricalClient,
+    args: &FetchArgs,
+    request: &Request,
+) -> Result<spend::Quote> {
+    let quote = spend::fetch(client, &request.metadata_params()).await?;
+    spend::approve(&quote, args.spend)?;
+    Ok(quote)
 }
 
 /// Claims an output name by creating it exclusively.

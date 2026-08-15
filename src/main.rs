@@ -72,6 +72,9 @@ async fn run() -> Result<Outcome> {
             }
         },
         Some(Command::Dataset(dataset_args)) => dataset::run(&mut client, dataset_args).await,
+        Some(Command::Get(get_args)) => {
+            jobs::download(&mut client, &get_args.job_id, &get_args.output).await
+        }
         None => fetch::run(&mut client, &args.fetch).await,
     }
 }

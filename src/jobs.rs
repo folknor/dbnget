@@ -9,7 +9,7 @@ use databento::{
     dbn::Encoding,
     historical::batch::{BatchJob, DownloadParams, JobState, ListJobsParams, SubmitJobParams},
 };
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 use tracing::warn;
 
 use crate::{Outcome, cli::ListArgs, query, verify};
@@ -296,18 +296,58 @@ const SYMBOL_WIDTH: usize = 28;
 pub fn print_job(job: &BatchJob) {
     let cost = job
         .cost_usd
-        .map_or_else(|| "-".to_owned(), |c| format!("${c:.2}"));
+        .map_or_else(|| "-".to_owned(), crate::spend::money);
     let size = job.actual_size.map_or_else(|| "-".to_owned(), human_bytes);
     println!(
-        "{id}  {state:<10}  {dataset:<10} {schema:<10} {selection:<34}  {start}..{end}  {cost:>8}  {size:>9}",
+        "{id}  {state:<10}  {dataset:<10} {schema:<10} {selection:<34}  {range:<41}  {shape:<16}  {cost:>10}  {size:>9}",
         id = job.id,
         state = format!("{:?}", job.state),
         dataset = job.dataset,
         schema = job.schema.to_string(),
         selection = selection(job),
-        start = job.start.date(),
-        end = job.end.date(),
+        range = range(job),
+        shape = shape(job),
     );
+}
+
+/// Whole-date stamps hide as much as they show, so the times come out when they matter.
+const RANGE_STAMP: &[FormatItem<'_>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+
+/// A job's range, at the precision the job actually has.
+///
+/// Rendering bounds as bare dates is what makes this listing lie about the thing it
+/// exists to answer. A job covering 12:30 to 14:00 on one day printed as
+/// `2022-06-10..2022-06-10`, which reads as a whole-day job whose end is inclusive - so
+/// a user comparing it against a whole-day request sees a match, submits, and is told
+/// the request is new. The match key is on exact instants; the display has to be too.
+fn range(job: &BatchJob) -> String {
+    let midnight_aligned = |t: OffsetDateTime| t.time() == time::Time::MIDNIGHT;
+    if midnight_aligned(job.start) && midnight_aligned(job.end) {
+        // Bare dates are honest here, and the end is genuinely exclusive: a one-day job
+        // runs to the following midnight, so showing the day before it would claim a
+        // range the job does not cover.
+        return format!("{}..{}", job.start.date(), job.end.date());
+    }
+    let stamp = |t: OffsetDateTime| {
+        t.format(RANGE_STAMP)
+            .unwrap_or_else(|_| t.unix_timestamp().to_string())
+    };
+    format!("{}..{}", stamp(job.start), stamp(job.end))
+}
+
+/// The output-shaping fields a request has to agree on to adopt this job.
+///
+/// Encoding and `limit` are part of the match key and were invisible here, which is the
+/// other half of why a job could look adoptable and not be: a CSV job capped at 1000
+/// records is not a substitute for an uncapped DBN request over the same records, and
+/// nothing on the line said so.
+fn shape(job: &BatchJob) -> String {
+    let mut out = job.encoding.to_string();
+    if let Some(limit) = job.limit {
+        out.push_str(&format!(" limit:{limit}"));
+    }
+    out
 }
 
 /// The symbols a job covers, qualified by the symbology they are written in.
@@ -584,6 +624,39 @@ mod tests {
             "{summary} should count the remainder"
         );
         assert!(summary.len() <= SYMBOL_WIDTH + 4, "{summary} is too wide");
+    }
+
+    /// An intraday job rendered as bare dates is indistinguishable from a whole-day one,
+    /// and that is exactly the reading that makes a correct non-match look like a bug in
+    /// the matcher.
+    #[test]
+    fn an_intraday_range_shows_its_times() {
+        let job = job_from(&params(|p| {
+            p.date_time_range = DateTimeRange::from(
+                datetime!(2022-06-10 12:30 UTC)..datetime!(2022-06-10 14:00 UTC),
+            );
+        }));
+        assert_eq!(range(&job), "2022-06-10T12:30:00..2022-06-10T14:00:00");
+    }
+
+    #[test]
+    fn a_whole_day_range_stays_as_dates() {
+        let job = job_from(&params(|_| {}));
+        assert_eq!(range(&job), "2024-05-01..2024-05-02");
+    }
+
+    /// Both fields are part of the match key, so a job differing in either is not
+    /// adoptable - the listing has to show them or the user cannot tell why.
+    #[test]
+    fn the_shape_column_shows_encoding_and_limit() {
+        let plain = job_from(&params(|_| {}));
+        assert_eq!(shape(&plain), "dbn");
+
+        let capped = job_from(&params(|p| {
+            p.encoding = Encoding::Csv;
+            p.limit = NonZeroU64::new(1_000);
+        }));
+        assert_eq!(shape(&capped), "csv limit:1000");
     }
 
     #[test]

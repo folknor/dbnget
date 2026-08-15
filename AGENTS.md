@@ -54,16 +54,38 @@ Collapsing 3 into 0 or 1 destroys that workflow.
 
 ## Settled decisions (do not relitigate without cause)
 
-- **The spend gate defaults to $0.00.** Databento prices a request an active
-  subscription already covers at exactly $0.00, so the default posture is "fetch only
-  what I have already paid for". `--spend USD` caps a run. A quote above the cap
-  REFUSES rather than truncating the request to fit - silently fetching less than
-  asked for is worse than stopping.
-- **A $0.00 quote is ambiguous and the record count disambiguates it.** It means
-  either "covered by subscription" or "matches nothing". A zero-record request is an
-  error, not a free pass. Do not simplify this check away. It applies on ADOPTION as
-  well as before a submit: an empty job already on the account is refused rather than
-  ignored, because ignoring it would fall through and submit a duplicate.
+- **The spend gate defaults to $0.00, and caps LIST PRICE rather than the bill.** The
+  cost endpoint prices a request with no reference to the account: data a subscription
+  covers quotes identically to data nobody paid for, and it answers in sub-cent
+  fractions. Measured 2026-08-15: `XNAS.ITCH ohlcv-1m MSFT` for one day quotes
+  `0.000479400158`, while the finished job for that same data reports `cost_usd: 0.0`.
+  The earlier claim here that a covered request quotes exactly zero was FALSE against
+  the live API. The practical consequence is that the $0.00 default refuses nearly
+  everything with records in it, and that is accepted rather than fixed: rounding the
+  comparison to cents would make the default reachable by authorizing real sub-cent
+  charges under a cap the user set to zero, and nothing available before a submit can
+  tell "covered" from "cheap", so a `--free` mode would have nothing to compute.
+  `--spend USD` caps a run. A quote above the cap REFUSES rather than truncating the
+  request to fit - silently fetching less than asked for is worse than stopping.
+- **Money is rendered at the precision it needs, and compared exactly.** Two decimals
+  turned a real refusal into "quoted $0.00 exceeds the --spend cap of $0.00", which
+  asserts that zero exceeds zero and says nothing about what cap would work. Sub-cent
+  amounts widen to two significant digits (`$0.00048`); the comparison never widens.
+- **A $0.00 quote is ambiguous and the record count disambiguates it.** A zero-record
+  request is an error, not a free pass. Do not simplify this check away. It applies on
+  ADOPTION as well as before a submit: an empty job already on the account is refused
+  rather than ignored, because ignoring it would fall through and submit a duplicate.
+- **`dbnget get JOB_ID` is the escape hatch from exact matching, and it cannot
+  charge.** Adoption requires reproducing the request field for field, which is
+  correct for deciding whether to spend and useless for retrieving a job whose command
+  was lost. Downloading a prepared job costs nothing, so this path has no spend gate;
+  it shares the manifest verification with adoption.
+- **`dbnget list` must show every field adoption keys on that is not obvious.**
+  Rendering bounds as bare dates hid an intraday job's times, so a 12:30-14:00 job
+  printed as `2022-06-10..2022-06-10` and read as a whole-day job with an inclusive
+  end - filed as an end-exclusive matcher bug when the matcher was right. Encoding and
+  `limit` were invisible for the same reason. A listing that cannot explain a non-match
+  sends people looking for bugs in the match key.
 - **dbnget is published on crates.io.** The spend gate protects arbitrary users with
   billable keys, not just this account. Hold it to that standard: never weaken, skip,
   or default-bypass it on the grounds that some particular key cannot be charged.
@@ -93,7 +115,10 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   I/O error as "does not exist" turns a permissions problem into a charge. So both the
   destination and its `.part` sibling are created with an exclusive create up front,
   the final rename only ever replaces this run's own placeholder, and a failed request
-  releases the claims so a retry is possible. Filenames carry seconds and nanoseconds
+  releases the claims so a retry is possible - and so does a refusal by the spend gate,
+  which is the case that was missed: a run that charged nothing left two empty files
+  behind, and the next run reported the data as already paid for. Nothing after the
+  first byte arrives may release a claim. Filenames carry seconds and nanoseconds
   because minute precision let two differently-priced requests collide.
 - **A corrupt batch file is removed before the client is asked for it again.** The
   client skips any file whose size already matches the manifest, without reading it, so
@@ -139,8 +164,8 @@ Detail lives in the code; this is the map.
   construction, and API-key resolution (a `db-` value is the key itself, anything
   else is a path to a file holding one; `DATABENTO_API_KEY` gets identical
   treatment).
-- `cli.rs` - the clap surface. Symbols are positional; `list` and `dataset` are the
-  only subcommands, and a bare invocation is the fetch verb.
+- `cli.rs` - the clap surface. Symbols are positional; `list`, `dataset` and `get` are
+  the only subcommands, and a bare invocation is the fetch verb.
 - `query.rs` - parsing flat CLI arguments into the client's types: dates, RFC 3339
   instants, the half-open range (a bare `--start` covers exactly that UTC day),
   symbols, states, formats.

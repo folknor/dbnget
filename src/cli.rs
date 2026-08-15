@@ -33,6 +33,29 @@ pub enum Command {
     List(ListArgs),
     /// Show one dataset: its available range and schemas, or its publishers.
     Dataset(DatasetArgs),
+    /// Download a finished batch job by its id.
+    Get(GetArgs),
+}
+
+/// `dbnget get JOB_ID` - download a job the account already owns.
+///
+/// Reconciliation adopts a finished job only when the command reproduces the original
+/// request exactly, field for field. That is the right rule for deciding whether to
+/// spend money, and a poor one for retrieving data already bought: a job whose exact
+/// command has been lost is otherwise unreachable, and `dbnget list` shows plenty of
+/// them. Naming the job directly skips the reconstruction entirely.
+///
+/// Nothing here can charge. The job is already paid for, the files already prepared,
+/// and downloading them again costs nothing - which is why this path has no spend gate,
+/// and why it is not a hole in one.
+#[derive(Debug, Args)]
+pub struct GetArgs {
+    /// The job id, as shown by `dbnget list jobs`.
+    pub job_id: String,
+
+    /// Directory to write the job's files into. They land in `OUTPUT/JOB_ID/`.
+    #[arg(short, long, default_value = ".")]
+    pub output: PathBuf,
 }
 
 /// The default command: fetch data for a set of symbols.
@@ -106,9 +129,16 @@ pub struct FetchArgs {
     #[arg(long)]
     pub immediate: bool,
 
-    /// The most this request may cost, in US dollars. Without it, anything that
-    /// would cost more than $0.00 is refused, so the default fetches only what a
-    /// subscription already covers.
+    /// The most this request may cost, in US dollars. Without it, the cap is $0.00 and
+    /// anything with a price is refused.
+    ///
+    /// The cap is checked against the vendor's list price, which is quoted per request
+    /// with no reference to your account. A subscription that will bill you $0.00 for
+    /// this data does not change the quote, and prices run to fractions of a cent, so
+    /// the default cap refuses nearly everything that holds records. Use `--cost` to see
+    /// the price, then pass a cap at or above it. There is no "only if free" setting:
+    /// nothing the API offers before a submit can tell "covered by a subscription" from
+    /// "cheap", so such a flag would be a guess about your money.
     #[arg(long, value_name = "USD")]
     pub spend: Option<f64>,
 
