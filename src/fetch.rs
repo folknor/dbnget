@@ -289,7 +289,18 @@ async fn immediate(
     // component is inaccessible - is a failure that must happen while the request is
     // still free.
     let claimed = claim(&path)?;
-    let claimed_partial = claim(&partial)?;
+    // The second claim is the one that can fail with the first already made. Letting `?`
+    // return here would leave the final name reserved by a run that never priced
+    // anything, so the next attempt is refused over an empty file it did not create -
+    // the same stranded-claim failure as a refusal by the spend gate, one line earlier.
+    let claimed_partial = match claim(&partial) {
+        Ok(file) => file,
+        Err(err) => {
+            drop(claimed);
+            release(&path).await;
+            return Err(err);
+        }
+    };
 
     // Pricing and the gate come after the claims and before anything is billed, so a
     // refusal here has spent nothing and written nothing - and the two empty files it

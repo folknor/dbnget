@@ -67,16 +67,17 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   tell "covered" from "cheap", so a `--free` mode would have nothing to compute.
   `--spend USD` caps a run. A quote above the cap REFUSES rather than truncating the
   request to fit - silently fetching less than asked for is worse than stopping.
-- **Money is rendered at the precision it needs, and compared exactly.** Two decimals
-  turned a real refusal into "quoted $0.00 exceeds the --spend cap of $0.00", which
-  asserts that zero exceeds zero and says nothing about what cap would work. Sub-cent
-  amounts widen to two significant digits (`$0.00048`); the comparison never widens.
-- **A refusal names the smallest `--spend` that would work, and it rounds UP.** The
-  gate compares exactly, so a suggestion rounded to nearest is refused about half the
-  time it is offered, and advice that does not work is worse than none. It is also the
-  MINIMUM: suggesting a round `$0.01` would ask for twenty times the quote to be
-  authorized for no reason. `minimum_cap` and `money` share one precision rule so the
-  suggested number and the printed price cannot disagree.
+- **A printed price never understates, and is always itself an acceptable `--spend`.**
+  That single rule is `money`, and `minimum_cap` IS `money` with the dollar sign
+  removed - not a parallel rule that agrees with it, because a parallel rule is what
+  drifted. Rounding to nearest is the defect: at two decimals a refusal read "quoted
+  $0.00 exceeds the --spend cap of $0.00", asserting that zero exceeds zero; fixing
+  only the sub-cent branch moved the same contradiction above a cent, where a true
+  $0.0105 printed as `$0.01`, was refused by a $0.01 cap that accepted a genuine $0.01,
+  and suggested `0.02` - twice the needed cap. So: shortest rendering that reproduces
+  the value exactly, else shortest with two significant digits, rounded UP. The
+  comparison in `approve` never widens. Test
+  `the_printed_price_is_always_an_acceptable_cap` is the invariant; keep it passing.
 - **`--cost` answers the gate question, not just the price question.** Anyone running
   it is deciding whether to run the real command; a price read without the verdict says
   "free" at an amount the very next invocation refuses. It respects a `--spend` passed
@@ -110,8 +111,18 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   Rendering bounds as bare dates hid an intraday job's times, so a 12:30-14:00 job
   printed as `2022-06-10..2022-06-10` and read as a whole-day job with an inclusive
   end - filed as an end-exclusive matcher bug when the matcher was right. Encoding and
-  `limit` were invisible for the same reason. A listing that cannot explain a non-match
-  sends people looking for bugs in the match key. The same rule covers the two byte
+  `limit` were invisible for the same reason, and so was `stype_out`, which sits in the
+  OUTPUT column rather than beside the symbols because the symbol column qualifies the
+  selection with the symbology it is WRITTEN in. Ranges carry nanoseconds when they have
+  them, since adoption compares nanosecond instants and whole seconds would print
+  `12:30:00.1` and `12:30:00.9` identically. A listing that cannot explain a non-match
+  sends people looking for bugs in the match key. The listing is still NOT complete:
+  `job_matches` also reads `compression`, `split_duration`, `split_size`,
+  `split_symbols`, `delivery`, `pretty_px` and `map_symbols`, and none of them appear.
+  dbnget submits fixed values for all of them, so a job it created cannot differ - but a
+  job created in the web UI can, and it renders identically to an adoptable one while
+  refusing to be adopted. Adding a field to `job_matches` without asking how a user
+  would SEE that field is how this defect keeps recurring. The same rule covers the two byte
   counts: `actual_size` is uncompressed data and `package_size` is the download, they
   differ by 4-5x on compressed DBN and in the other direction on a handful of small
   text files, so one unlabelled number gets read as the download and is not it.
@@ -152,8 +163,10 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   the final rename only ever replaces this run's own placeholder, and a failed request
   releases the claims so a retry is possible - and so does a refusal by the spend gate,
   which is the case that was missed: a run that charged nothing left two empty files
-  behind, and the next run reported the data as already paid for. Nothing after the
-  first byte arrives may release a claim. THE FILE NAME MUST KEY ON THE WHOLE REQUEST,
+  behind, and the next run reported the data as already paid for. So does a FAILURE OF
+  THE SECOND CLAIM, which strands the first the same way. Every exit between the first
+  claim and the first byte must release what it took; nothing after the first byte
+  arrives may release anything. THE FILE NAME MUST KEY ON THE WHOLE REQUEST,
   for the same reason the match key does: it carried only dataset, schema and range, so
   AAPL and MSFT over one window shared a path, and the second request was told the
   first's file was data it had already paid for - advice that destroys the first

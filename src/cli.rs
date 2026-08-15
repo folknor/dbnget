@@ -101,6 +101,13 @@ pub struct FetchArgs {
     /// `raw_symbol` and every ES future as a `parent`. This flag is part of what
     /// identifies a job, so changing it makes a different request, not the same one
     /// spelled differently.
+    ///
+    /// The historical API currently accepts four of these as input: `raw_symbol`,
+    /// `instrument_id`, `parent` and `continuous`. The rest are the vendor's full
+    /// symbology set, available elsewhere in their API and not on the historical
+    /// endpoints dbnget uses; passing one is refused by the server, which names the set
+    /// it will take. They are listed rather than removed because the accepted set is
+    /// the vendor's to change, and refusing them here would outlast the restriction.
     #[arg(long, default_value = "raw_symbol", value_name = "STYPE")]
     pub stype_in: CliSType,
 

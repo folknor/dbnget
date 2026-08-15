@@ -24,7 +24,8 @@ impl Quote {
     }
 }
 
-/// Renders a dollar amount at enough precision to explain itself.
+/// Renders a dollar amount under one rule: **it never states a price lower than the
+/// real one, and what it prints is always a `--spend` value that would be accepted.**
 ///
 /// Two decimals is the natural way to write money and the wrong way to write this
 /// number. The cost endpoint quotes list price to sub-cent precision - a day of
@@ -32,10 +33,16 @@ impl Quote {
 /// decimals reads "quoted $0.00 exceeds the --spend cap of $0.00", which states that
 /// zero exceeds zero and tells the user nothing about what to pass instead.
 ///
-/// The comparison stays exact; only the rendering widens. Precision grows until a
-/// significant digit appears, so ordinary prices still read as `$12.34` and only the
-/// amounts that need the extra digits pay for them. An exact zero is the one amount
-/// `$0.00` describes perfectly, and no amount of precision would find a digit in it.
+/// Fixing that below a cent while leaving `{:.2}` above it just moved the same
+/// contradiction up: a true $0.0105 printed as `$0.01` and was then refused by a $0.01
+/// cap, while a genuine $0.01 was accepted by it - two requests displaying the same
+/// price behaving oppositely, with nothing on screen to tell them apart. Rounding to
+/// NEAREST is the whole defect, because a price that rounds down reads as affordable
+/// under a cap that refuses it.
+///
+/// So: the shortest rendering that reproduces the value exactly, and failing that, the
+/// shortest that has two significant digits and rounds UP. The comparison in `approve`
+/// never widens; only the rendering does.
 pub fn money(usd: f64) -> String {
     if !usd.is_finite() {
         return format!("${usd}");
@@ -43,61 +50,70 @@ pub fn money(usd: f64) -> String {
     if usd == 0.0 {
         return "$0.00".to_owned();
     }
-    if let Some(precision) = precision_for(usd) {
-        let rendered = format!("{usd:.precision$}");
-        return format!("${}", trimmed(&rendered));
+    match rendering(usd) {
+        Some(rendered) => format!("${rendered}"),
+        // Smaller than the widest fixed rendering can show, but not zero: say so rather
+        // than printing a row of zeroes that reads as free.
+        None => format!("${usd:e}"),
     }
-    // Smaller than the widest fixed rendering can show, but not zero: say so rather
-    // than printing a row of zeroes that reads as free.
-    format!("${usd:e}")
 }
 
 /// Where widening stops. Databento quotes to twelve places; past this the digits stop
 /// telling a user anything they can act on, and `--spend` cannot express them anyway.
 const MAX_PRECISION: usize = 8;
 
-/// How many decimals it takes to say something about `usd`, or `None` if even the
-/// widest rendering would be all zeroes.
+/// The decimal string this amount is written as, or `None` if no fixed rendering within
+/// `MAX_PRECISION` can carry it.
 ///
-/// Two decimals whenever they carry a digit. Below a cent, the first precision that
-/// shows a digit and then one more: the first digit alone rounds, so $0.000479 would
-/// render as `$0.0005`, a price the request does not have, in the direction that
-/// overstates it. A second significant digit makes it `$0.00048`.
-fn precision_for(usd: f64) -> Option<usize> {
-    let significant = |s: &str| s.contains(|c: char| c.is_ascii_digit() && c != '0');
-    if significant(&format!("{usd:.2}")) {
-        return Some(2);
+/// Two passes. The first looks for a precision that round-trips - `0.01`, `12.50`,
+/// `27.135`, `0.0105` all reproduce themselves - and that is both the shortest honest
+/// spelling and, being exact, never an understatement.
+///
+/// The second is for values with more decimals than the rendering allows, like the
+/// twelve-place `0.000479400158`. There is no exact spelling, so it rounds UP, at the
+/// first precision carrying two significant digits: `$0.00048`. One digit would be
+/// `$0.0005`, which overstates by a fifth, and rounding to nearest would give
+/// `$0.00047940`, which understates and so breaks the rule the whole function exists
+/// for. Above a cent this pass rounds up at the cent, which for a value needing more
+/// than eight decimals is floating-point noise rather than a price - and overstating is
+/// the safe direction to be wrong in.
+fn rendering(usd: f64) -> Option<String> {
+    // `total_cmp` rather than `==` because bit-for-bit identity is exactly what is being
+    // asked: does this many decimals reproduce the price, or is a digit being lost?
+    let exact = (2..=MAX_PRECISION).find(|p| {
+        format!("{usd:.p$}")
+            .parse::<f64>()
+            .is_ok_and(|round_tripped| usd.total_cmp(&round_tripped).is_eq())
+    });
+    if let Some(precision) = exact {
+        return Some(format!("{usd:.precision$}"));
     }
-    (3..=MAX_PRECISION)
-        .find(|p| significant(&format!("{usd:.p$}")))
-        .map(|p| (p + 1).min(MAX_PRECISION))
-}
 
-/// Drops the trailing zeroes the extra digit of precision earned, so `$0.0009` does not
-/// come out as `$0.00090`. Never eats the decimal point or a whole-cent rendering.
-fn trimmed(rendered: &str) -> &str {
-    match rendered.split_once('.') {
-        Some((_, decimals)) if decimals.len() > 2 => rendered.trim_end_matches('0'),
-        _ => rendered,
-    }
+    let significant_digits = |s: &str| {
+        s.trim_start_matches(['0', '.'])
+            .chars()
+            .filter(char::is_ascii_digit)
+            .count()
+    };
+    (2..=MAX_PRECISION).find_map(|precision| {
+        let scale = scale_for(precision);
+        let rounded_up = (usd * scale).ceil() / scale;
+        let rendered = format!("{rounded_up:.precision$}");
+        (significant_digits(&rendered) >= 2).then_some(rendered)
+    })
 }
 
 /// The smallest `--spend` value that would let `usd` through, as the user must type it.
 ///
-/// Rounded UP at the precision it is rendered to, which is the whole point: the gate
-/// compares exactly, so a suggestion rounded to nearest is refused half the time it is
-/// offered, and nothing is more useless than an error message whose advice does not
-/// work. The suggestion is also the MINIMUM that works - naming a round `0.01` instead
-/// would ask the user to authorize twenty times the quote for no reason.
+/// It is the printed price with the dollar sign taken off, and that is the point: one
+/// rule, so the number on screen and the number in the advice cannot disagree. Because
+/// the rendering never understates, the price shown is always itself an acceptable cap.
+///
+/// Deriving the suggestion separately is what let a true $0.0105 print as `$0.01` and
+/// suggest `--spend 0.02` - twice the cap the request needed, from a display that had
+/// already lost the digit explaining why a cent was not enough.
 pub fn minimum_cap(usd: f64) -> String {
-    let Some(precision) = precision_for(usd) else {
-        // Too small to render, but not zero. There is no shorter honest suggestion than
-        // the smallest amount the rendering can express.
-        return format!("{:.*}", MAX_PRECISION, 1.0 / scale_for(MAX_PRECISION));
-    };
-    let scale = scale_for(precision);
-    let ceiling = (usd * scale).ceil() / scale;
-    trimmed(&format!("{ceiling:.precision$}")).to_owned()
+    money(usd).trim_start_matches('$').to_owned()
 }
 
 /// Ten to the `precision`, built by multiplication rather than `powi` so no exponent
@@ -120,6 +136,13 @@ pub fn verdict(quote: &Quote, spend: Option<f64>) -> String {
             None => "yes, no --spend needed".to_owned(),
         },
         Err(err) if quote.is_empty() => format!("no - {err}"),
+        // A quote the gate cannot account for is refused before any cap is considered,
+        // and no cap would admit it: `approve` rejects a negative or non-finite cap as
+        // firmly as it rejects the quote. Falling through to the suggestion would print
+        // `pass --spend NaN`, which is advice that cannot work - and the rule every
+        // other number in this module follows is that what is printed is a value the
+        // gate would accept.
+        Err(err) if !quote.usd.is_finite() || quote.usd < 0.0 => format!("no - {err}"),
         Err(_) => {
             let cap = spend.map_or_else(
                 || "the default $0.00 cap".to_owned(),
@@ -299,15 +322,69 @@ mod tests {
     fn ordinary_amounts_keep_two_decimals() {
         assert_eq!(money(0.0), "$0.00");
         assert_eq!(money(12.5), "$12.50");
-        assert_eq!(money(1234.567), "$1234.57");
         assert_eq!(money(0.01), "$0.01");
+        assert_eq!(money(73.41), "$73.41");
+
+        // Three decimals when two would not reproduce the price. Printing `$27.14`
+        // here would be understating it by half a cent.
+        assert_eq!(money(27.135), "$27.135");
+    }
+
+    /// A spread of prices: real quotes seen from the API, the awkward ones around a
+    /// cent, and the extremes.
+    const PRICES: [f64; 12] = [
+        0.000_479_400_158,
+        0.0009,
+        0.004,
+        0.0105,
+        0.01,
+        0.0199,
+        0.79,
+        12.5,
+        24.06,
+        27.135,
+        73.41,
+        1e-12,
+    ];
+
+    /// The rule the whole module turns on: what is printed is never less than the real
+    /// price, and is always itself a cap that the gate would accept. Everything the
+    /// user reads - the price, the refusal, the `--cost` verdict - inherits it.
+    #[test]
+    fn the_printed_price_is_always_an_acceptable_cap() {
+        for usd in PRICES {
+            let printed = money(usd);
+            let as_cap: f64 = printed.trim_start_matches('$').parse().unwrap();
+            assert!(
+                as_cap >= usd,
+                "{printed} understates {usd}, so it reads as affordable under a cap that refuses it"
+            );
+            approve(&quote(usd, 100), Some(as_cap)).unwrap();
+            assert_eq!(minimum_cap(usd), printed.trim_start_matches('$'));
+        }
+    }
+
+    /// The reported regression: fixed below a cent, the same contradiction remained
+    /// above it. A true $0.0105 printed as `$0.01` and was refused by a $0.01 cap,
+    /// while a genuine $0.01 was accepted by it - and the advice jumped a whole cent to
+    /// `0.02`, twice what the request needed.
+    #[test]
+    fn a_price_just_over_a_cent_is_not_rounded_down_to_it() {
+        assert_eq!(money(0.0105), "$0.0105");
+        assert_eq!(minimum_cap(0.0105), "0.0105");
+        assert_ne!(money(0.0105), money(0.01));
+
+        // The two now behave the same way under the cap each one displays.
+        approve(&quote(0.0105, 100), Some(0.0105)).unwrap();
+        approve(&quote(0.01, 100), Some(0.01)).unwrap();
+        assert!(approve(&quote(0.0105, 100), Some(0.01)).is_err());
     }
 
     /// A suggested cap that gets refused is worse than no suggestion, so it rounds up.
     /// Rounded to nearest, the quote below would suggest `0.00047` and be refused.
     #[test]
     fn the_suggested_cap_is_the_smallest_one_that_works() {
-        for usd in [0.000_479_400_158, 0.0009, 12.5, 0.004, 27.135, 1e-12] {
+        for usd in PRICES {
             let suggested: f64 = minimum_cap(usd).parse().unwrap();
             assert!(
                 suggested >= usd,
@@ -328,6 +405,21 @@ mod tests {
             .to_string();
         assert!(err.contains("--spend 0.00048"), "{err}");
         assert!(err.contains("adopts"), "{err}");
+    }
+
+    /// The invariant has to hold for the quotes the gate refuses outright, not just the
+    /// ones it prices. A negative or non-finite quote has no cap that would admit it,
+    /// so the verdict must not name one.
+    #[test]
+    fn a_quote_the_gate_cannot_account_for_is_never_given_a_cap_to_pass() {
+        for usd in [-1.0, f64::NAN, f64::INFINITY] {
+            let said = verdict(&quote(usd, 100), None);
+            assert!(
+                !said.contains("--spend"),
+                "{said} offers a cap for a quote of {usd}"
+            );
+            assert!(said.starts_with("no"), "{said}");
+        }
     }
 
     #[test]

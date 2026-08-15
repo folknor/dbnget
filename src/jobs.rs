@@ -308,7 +308,7 @@ const SYMBOL_WIDTH: usize = 28;
 /// line up with, and a header over one row is noise.
 fn print_header() {
     println!(
-        "{id:<24}  {state:<10}  {dataset:<10} {schema:<10} {selection:<34}  {range:<41}  {shape:<16}  {cost:>10}  {size:>9}  {delivered:>9}",
+        "{id:<24}  {state:<10}  {dataset:<10} {schema:<10} {selection:<34}  {range:<49}  {shape:<38}  {cost:>10}  {size:>9}  {delivered:>9}",
         id = "JOB ID",
         state = "STATE",
         dataset = "DATASET",
@@ -335,7 +335,7 @@ pub fn print_job(job: &BatchJob) {
     let size = job.actual_size.map_or_else(|| "-".to_owned(), human_bytes);
     let delivered = job.package_size.map_or_else(|| "-".to_owned(), human_bytes);
     println!(
-        "{id}  {state:<10}  {dataset:<10} {schema:<10} {selection:<34}  {range:<41}  {shape:<16}  {cost:>10}  {size:>9}  {delivered:>9}",
+        "{id:<24}  {state:<10}  {dataset:<10} {schema:<10} {selection:<34}  {range:<49}  {shape:<38}  {cost:>10}  {size:>9}  {delivered:>9}",
         id = job.id,
         state = format!("{:?}", job.state),
         dataset = job.dataset,
@@ -349,6 +349,23 @@ pub fn print_job(job: &BatchJob) {
 /// Whole-date stamps hide as much as they show, so the times come out when they matter.
 const RANGE_STAMP: &[FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+
+/// A bound at whatever precision it carries, down to the nanosecond.
+///
+/// Adoption compares nanosecond instants, so a listing that stops at whole seconds can
+/// print two genuinely different - and differently priced - jobs identically. That is
+/// the bare-dates defect again, one unit further down: `12:30:00.1` and `12:30:00.9`
+/// are not the same request, and a user comparing them against their own has no way to
+/// see it. `--immediate` file names already carry nanoseconds for the same reason.
+fn instant(t: OffsetDateTime) -> String {
+    let base = t
+        .format(RANGE_STAMP)
+        .unwrap_or_else(|_| t.unix_timestamp().to_string());
+    match t.nanosecond() {
+        0 => base,
+        nanos => format!("{base}.{}", format!("{nanos:09}").trim_end_matches('0')),
+    }
+}
 
 /// A job's range, at the precision the job actually has.
 ///
@@ -365,21 +382,22 @@ fn range(job: &BatchJob) -> String {
         // range the job does not cover.
         return format!("{}..{}", job.start.date(), job.end.date());
     }
-    let stamp = |t: OffsetDateTime| {
-        t.format(RANGE_STAMP)
-            .unwrap_or_else(|_| t.unix_timestamp().to_string())
-    };
-    format!("{}..{}", stamp(job.start), stamp(job.end))
+    format!("{}..{}", instant(job.start), instant(job.end))
 }
 
 /// The output-shaping fields a request has to agree on to adopt this job.
 ///
-/// Encoding and `limit` are part of the match key and were invisible here, which is the
-/// other half of why a job could look adoptable and not be: a CSV job capped at 1000
-/// records is not a substitute for an uncapped DBN request over the same records, and
-/// nothing on the line said so.
+/// Encoding, output symbology and `limit` are all part of the match key and were all
+/// invisible here, which is the other half of why a job could look adoptable and not be:
+/// a CSV job capped at 1000 records is not a substitute for an uncapped DBN request over
+/// the same records, and nothing on the line said so.
+///
+/// `stype_out` belongs with them rather than beside the symbols. The symbol column
+/// qualifies the selection with the symbology it is WRITTEN in, which is `stype_in`;
+/// how symbols come back in the delivered records is a property of the output, and
+/// putting it here keeps the line from growing another column.
 fn shape(job: &BatchJob) -> String {
-    let mut out = job.encoding.to_string();
+    let mut out = format!("{} out:{}", job.encoding, job.stype_out);
     if let Some(limit) = job.limit {
         out.push_str(&format!(" limit:{limit}"));
     }
@@ -575,33 +593,86 @@ mod tests {
         assert!(!effective_map_symbols(&explicit));
     }
 
-    /// Every field here changes the bytes the job delivers, so a job differing in any
-    /// one of them is not a substitute for the submission being matched.
+    /// Every field the match key reads changes the bytes the job delivers, so a job
+    /// differing in any ONE of them is not a substitute for the submission being
+    /// matched. All of them are exercised, not a sample: the literal-struct fixtures
+    /// catch a field ADDED upstream and left out of `job_matches`, but nothing else
+    /// catches a field that is compared against the wrong operand or dropped from the
+    /// chain, and either one is a silent double charge.
     #[test]
     fn output_affecting_fields_prevent_a_match() {
         let baseline = params(|_| {});
         let job = job_from(&baseline);
         assert!(job_matches(&job, &baseline));
 
-        let mut differs = job.clone();
-        differs.pretty_px = !job.pretty_px;
-        assert!(!job_matches(&differs, &baseline), "pretty_px");
+        /// One named way an otherwise matching job can differ.
+        type Case = (&'static str, Box<dyn Fn(&mut BatchJob)>);
+
+        let cases: Vec<Case> = vec![
+            (
+                "dataset",
+                Box::new(|j| "XNAS.ITCH".clone_into(&mut j.dataset)),
+            ),
+            ("schema", Box::new(|j| j.schema = Schema::Mbo)),
+            ("stype_in", Box::new(|j| j.stype_in = SType::Parent)),
+            ("stype_out", Box::new(|j| j.stype_out = SType::RawSymbol)),
+            ("encoding", Box::new(|j| j.encoding = Encoding::Csv)),
+            (
+                "compression",
+                Box::new(|j| j.compression = Compression::None),
+            ),
+            (
+                "split_duration",
+                Box::new(|j| j.split_duration = SplitDuration::Week),
+            ),
+            (
+                "split_symbols",
+                Box::new(|j| j.split_symbols = !j.split_symbols),
+            ),
+            (
+                "split_size",
+                Box::new(|j| j.split_size = NonZeroU64::new(2_000_000_000)),
+            ),
+            // `delivery` is compared by `job_matches` but cannot be exercised here:
+            // upstream `Delivery` has exactly one variant, so no two values exist to
+            // differ. Add a case here the day it gains a second.
+            ("pretty_px", Box::new(|j| j.pretty_px = !j.pretty_px)),
+            ("pretty_ts", Box::new(|j| j.pretty_ts = !j.pretty_ts)),
+            ("map_symbols", Box::new(|j| j.map_symbols = !j.map_symbols)),
+            ("limit", Box::new(|j| j.limit = NonZeroU64::new(1_000))),
+            ("start", Box::new(|j| j.start -= time::Duration::seconds(1))),
+            ("end", Box::new(|j| j.end += time::Duration::seconds(1))),
+            (
+                "symbols",
+                Box::new(|j| j.symbols = Symbols::Symbols(vec!["NQM4".to_owned()])),
+            ),
+        ];
+
+        for (field, mutate) in cases {
+            let mut differs = job.clone();
+            mutate(&mut differs);
+            assert!(
+                !job_matches(&differs, &baseline),
+                "a job differing only in {field} was treated as this request"
+            );
+        }
+    }
+
+    /// A one-nanosecond difference in either bound is a different request at a
+    /// different price, and the bounds are the field most likely to be compared
+    /// loosely by accident.
+    #[test]
+    fn bounds_are_matched_to_the_nanosecond() {
+        let baseline = params(|_| {});
+        let job = job_from(&baseline);
 
         let mut differs = job.clone();
-        differs.pretty_ts = !job.pretty_ts;
-        assert!(!job_matches(&differs, &baseline), "pretty_ts");
+        differs.start += time::Duration::nanoseconds(1);
+        assert!(!job_matches(&differs, &baseline), "start");
 
         let mut differs = job.clone();
-        differs.map_symbols = !job.map_symbols;
-        assert!(!job_matches(&differs, &baseline), "map_symbols");
-
-        let mut differs = job.clone();
-        differs.split_size = NonZeroU64::new(2_000_000_000);
-        assert!(!job_matches(&differs, &baseline), "split_size");
-
-        let mut differs = job.clone();
-        differs.encoding = Encoding::Csv;
-        assert!(!job_matches(&differs, &baseline), "encoding");
+        differs.end -= time::Duration::nanoseconds(1);
+        assert!(!job_matches(&differs, &baseline), "end");
     }
 
     /// A CSV job gets `map_symbols` by default, and the submission carries `None`. The
@@ -681,18 +752,41 @@ mod tests {
         assert_eq!(range(&job), "2024-05-01..2024-05-02");
     }
 
-    /// Both fields are part of the match key, so a job differing in either is not
-    /// adoptable - the listing has to show them or the user cannot tell why.
+    /// Every one of these is part of the match key, so a job differing in any of them
+    /// is not adoptable - the listing has to show them or the user cannot tell why.
     #[test]
-    fn the_shape_column_shows_encoding_and_limit() {
+    fn the_shape_column_shows_encoding_output_symbology_and_limit() {
         let plain = job_from(&params(|_| {}));
-        assert_eq!(shape(&plain), "dbn");
+        assert_eq!(shape(&plain), "dbn out:instrument_id");
 
         let capped = job_from(&params(|p| {
             p.encoding = Encoding::Csv;
             p.limit = NonZeroU64::new(1_000);
         }));
-        assert_eq!(shape(&capped), "csv limit:1000");
+        assert_eq!(shape(&capped), "csv out:instrument_id limit:1000");
+
+        // Two jobs identical everywhere the listing used to look, differing only in the
+        // field that decides whether either can be adopted.
+        let raw = job_from(&params(|p| p.stype_out = SType::RawSymbol));
+        assert_ne!(shape(&raw), shape(&plain));
+    }
+
+    /// Adoption compares nanosecond instants, so a listing that stops at whole seconds
+    /// prints two different - and differently priced - requests identically.
+    #[test]
+    fn sub_second_bounds_are_visible_in_the_range() {
+        let early = job_from(&params(|p| {
+            p.date_time_range = DateTimeRange::from(
+                datetime!(2022-06-10 12:30:00.1 UTC)..datetime!(2022-06-10 14:00 UTC),
+            );
+        }));
+        let late = job_from(&params(|p| {
+            p.date_time_range = DateTimeRange::from(
+                datetime!(2022-06-10 12:30:00.9 UTC)..datetime!(2022-06-10 14:00 UTC),
+            );
+        }));
+        assert_eq!(range(&early), "2022-06-10T12:30:00.1..2022-06-10T14:00:00");
+        assert_ne!(range(&early), range(&late));
     }
 
     #[test]

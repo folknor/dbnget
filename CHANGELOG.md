@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verification adoption uses. Reconciliation only adopts a job when the command
   reproduces the original request exactly, which left jobs whose command was lost with
   no way to retrieve data the account had already bought.
-- `dbnget list` shows each job's encoding and record limit. Both are part of what a
-  request must match to adopt a job, and neither was visible.
+- `dbnget list` shows each job's encoding, output symbology and record limit. All are
+  part of what a request must match to adopt a job, and none were visible.
 - `dbnget list` gains a header row and a `DOWNLOAD` column. The size shown was the
   uncompressed data size, which overstates a compressed DBN download by 4-5x; the
   delivered package size now sits beside it, and both are labelled.
@@ -29,10 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Prices below a cent are printed at the precision they need. `--spend 0` against a
-  request quoted at $0.000479 refused with "quoted $0.00 exceeds the --spend cap of
-  $0.00", which asserts that zero exceeds zero and gives no usable cap. It now reads
-  `quoted $0.00048`. The comparison is unchanged and still exact.
+- Prices are printed so that the figure shown is never lower than the real price and is
+  always itself an acceptable `--spend` value. Rounding to the nearest cent broke both:
+  `--spend 0` against a request quoted at $0.000479 refused with "quoted $0.00 exceeds
+  the --spend cap of $0.00", and above a cent a true $0.0105 printed as `$0.01`, was
+  refused by a $0.01 cap that accepted a genuine $0.01, and suggested a whole-cent
+  `0.02` - twice the cap the request needed. Prices now print at the shortest precision
+  that reproduces them, rounding up when none does, and the suggested cap is that same
+  figure. The gate's comparison is unchanged and still exact.
+- `dbnget list` shows each job's output symbology and any fractional seconds in its
+  bounds. Adoption matches on both, so two jobs that the listing rendered identically
+  could differ in the field explaining why neither was adopted.
+- `--immediate` releases the destination claim when the `.part` claim fails. A run that
+  charged nothing could strand an empty file at the final name, which the next attempt
+  then refused.
 - `dbnget list` shows a job's times when its bounds are not midnight-aligned. An
   intraday job printed as `2022-06-10..2022-06-10` was indistinguishable from a
   whole-day job with an inclusive end.
@@ -41,9 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the next attempt failed with "already exists ... rather than paying for it again"
   about data that was never bought.
 
-- Spend refusals name the smallest `--spend` value that would be accepted, rounded up
-  so the suggestion actually works, and mention that a matching job already on the
-  account is adopted rather than re-bought. Adoption was previously documented only
+- Spend refusals name the smallest `--spend` value that would be accepted, and mention
+  that a matching job already on the account is adopted rather than re-bought. Adoption was previously documented only
   inside the help for the positional symbols argument.
 - `--immediate` output filenames key on the whole request, not just dataset, schema and
   range. Two symbols fetched over one window previously shared a path, and the second

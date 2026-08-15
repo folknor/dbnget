@@ -1,9 +1,17 @@
 # dbnget
 
+[![crates.io](https://img.shields.io/crates/v/dbnget.svg)](https://crates.io/crates/dbnget)
+[![downloads](https://img.shields.io/crates/d/dbnget.svg)](https://crates.io/crates/dbnget)
+[![license](https://img.shields.io/crates/l/dbnget.svg)](LICENSE)
+[![msrv](https://img.shields.io/badge/msrv-1.97-blue.svg)](https://releases.rs)
+[![Built with LLMs](https://img.shields.io/badge/Built%20with-AI%20Agents-blueviolet)](LLM.md)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
 A command-line downloader for [Databento](https://databento.com) historical market
 data, built on the official `databento` Rust client.
 
-Built with LLMs. See [LLM.md](LLM.md).
+Built with LLMs. See [LLM.md](LLM.md). Contributions welcome - see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Install
 
@@ -136,12 +144,19 @@ endpoint prices a request with no reference to your account: data an active subs
 covers quotes exactly the same as data nobody has paid for, and it answers in fractions
 of a cent. A day of one symbol's minute bars is priced at $0.00048, and the job it
 produces then shows `$0.00` on the account. So the $0.00 default refuses nearly every
-request that holds records, and prices below a cent are printed at the precision they
-need rather than rounded to `$0.00`:
+request that holds records.
+
+Prices are printed under one rule: **the figure shown is never lower than the real
+price, and is always itself a `--spend` value that would be accepted.** Rounding to
+the nearest cent breaks both halves - a true $0.0105 shown as `$0.01` reads as
+affordable under a $0.01 cap that in fact refuses it, while a genuine $0.01 is accepted
+by the same cap, with nothing on screen to tell the two apart. So a price is written at
+the shortest precision that reproduces it exactly, and where no such precision exists it
+rounds up:
 
 ```
 $ dbnget MSFT -d XNAS.ITCH -s ohlcv-1m --start 2022-06-10 --spend 0
-Error: quoted $0.00048 exceeds the --spend cap of $0.00
+Error: quoted $0.00048 exceeds the --spend cap of $0.00; --spend 0.00048 would approve it
 ```
 
 There is deliberately no "only if it is free" mode. Nothing the API offers before a
@@ -184,8 +199,9 @@ symbols:       37 resolved, 5 partial, 0 not found
 The `would fetch` line is the question `--cost` is usually being asked, so it is
 answered outright rather than left to be inferred from a price and a default cap that is
 not on screen. It respects a `--spend` passed alongside it, and the cap it names is the
-quote rounded up - the smallest value that would actually be accepted, rather than a
-round number that authorizes more than the request needs.
+printed price itself - the smallest value that would be accepted, rather than a round
+number that authorizes more than the request needs. Those are one rule rather than two,
+so the number you read and the number you are told to pass cannot disagree.
 
 With `--immediate`, a `would write` line names the exact output path. The batch path has
 no equivalent: its files land in `OUTPUT/JOB_ID/`, and the job id does not exist until
@@ -284,9 +300,9 @@ what already exists before submitting - a widened `--end` is a new job that
 re-purchases the old range, and dbnget does not warn about overlaps.
 
 ```
-JOB ID                    STATE  DATASET    SCHEMA    SYMBOLS            RANGE (UTC)                                OUTPUT          COST      DATA   DOWNLOAD
-GLBX-20260805-HAPEWPABKG  Done   GLBX.MDP3  tbbo      continuous:MNQ.v.0  2026-06-30T22:00:00..2026-07-31T21:00:00  csv            $73.41   4.6 GiB  872.6 MiB
-XNAS-20260803-SU6U8HRT75  Done   XNAS.ITCH  ohlcv-1m  raw_symbol:MSFT     2022-06-10T12:30:00..2022-06-10T14:00:00  csv limit:1000  $0.00   8.1 KiB   10.3 KiB
+JOB ID                    STATE  DATASET    SCHEMA    SYMBOLS             RANGE (UTC)                               OUTPUT                            COST      DATA   DOWNLOAD
+GLBX-20260805-HAPEWPABKG  Done   GLBX.MDP3  tbbo      continuous:MNQ.v.0  2026-06-30T22:00:00..2026-07-31T21:00:00  csv out:instrument_id            $73.41   4.6 GiB  872.6 MiB
+XNAS-20260803-SU6U8HRT75  Done   XNAS.ITCH  ohlcv-1m  raw_symbol:MSFT     2022-06-10T12:30:00..2022-06-10T14:00:00  csv out:instrument_id limit:1000  $0.00   8.1 KiB   10.3 KiB
 ```
 
 `DATA` is the uncompressed record size and `DOWNLOAD` is the package that actually comes
@@ -296,11 +312,12 @@ while a job of a few small CSV and JSON files packages slightly larger.
 
 The columns after the range are the fields adoption matches on that are not otherwise
 visible. A job's bounds print as bare dates only when both fall on midnight; anything
-else shows its times, because an intraday job rendered as `2022-06-10..2022-06-10` reads
-like a whole-day job with an inclusive end, and comparing it against a whole-day request
-would suggest a match that will not happen. Encoding and `limit` are part of the same
-key: a CSV job capped at 1000 records is not a substitute for an uncapped DBN request
-over the same records.
+else shows its times, down to the nanosecond when it has them, because adoption compares
+exact instants - an intraday job rendered as `2022-06-10..2022-06-10` reads like a
+whole-day job with an inclusive end, and two bounds a fraction of a second apart are two
+different, differently priced requests. Encoding, output symbology and `limit` are part
+of the same key: a CSV job capped at 1000 records is not a substitute for an uncapped DBN
+request over the same records.
 
 Long symbol lists are truncated with a count of what was left out.
 

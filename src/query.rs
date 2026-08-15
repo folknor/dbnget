@@ -7,10 +7,14 @@ use databento::{
 };
 use time::{Date, Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::cli::{CliFormat, CliJobState};
-
-/// The sentinel the Databento API uses to mean "every symbol in the dataset".
-const ALL_SYMBOLS: &str = "ALL_SYMBOLS";
+use crate::{
+    cli::{CliFormat, CliJobState},
+    // The sentinel meaning "every symbol in the dataset" is defined once, next to the
+    // canonicalization that matching turns on. Two spellings of the string that decides
+    // whether the most expensive request an account can make is adopted or bought again
+    // is precisely the drift the shared canonicalization exists to prevent.
+    jobs::ALL_SYMBOLS,
+};
 
 /// Parses `YYYY-MM-DD` or a full RFC 3339 timestamp into a UTC instant.
 pub fn parse_instant(raw: &str) -> Result<OffsetDateTime> {
