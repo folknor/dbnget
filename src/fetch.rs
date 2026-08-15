@@ -47,7 +47,7 @@ pub async fn run(client: &mut HistoricalClient, args: &FetchArgs) -> Result<Outc
     let request = validate(args)?;
 
     if args.cost {
-        return cost(client, &request).await;
+        return cost(client, args, &request).await;
     }
     if args.immediate {
         return immediate(client, args, &request).await;
@@ -78,14 +78,33 @@ fn validate(args: &FetchArgs) -> Result<Request> {
 }
 
 /// `--cost`: price the request and stop. Never queues.
-async fn cost(client: &mut HistoricalClient, request: &Request) -> Result<Outcome> {
+async fn cost(
+    client: &mut HistoricalClient,
+    args: &FetchArgs,
+    request: &Request,
+) -> Result<Outcome> {
     let quote = spend::fetch(client, &request.metadata_params()).await?;
     println!("records:       {}", quote.records);
     println!("billable size: {} bytes", quote.billable_bytes);
     println!("cost:          {}", spend::money(quote.usd));
 
+    // The price alone is half an answer. Anyone running `--cost` is deciding whether to
+    // run the command for real, and the gate's verdict is that decision - a quote read
+    // without it says "free" at a price the very next command refuses.
+    println!("would fetch:   {}", spend::verdict(&quote, args.spend));
+
     if let Some(summary) = resolve_summary(client, request).await {
         println!("symbols:       {summary}");
+    }
+
+    // Only on the streaming path is there a name to print. A batch job lands in
+    // `OUTPUT/JOB_ID/`, and the job id does not exist until the job is submitted, so
+    // anything printed here would be an invention.
+    if args.immediate {
+        println!(
+            "would write:   {}",
+            args.output.join(request.file_name()?).display()
+        );
     }
 
     if quote.is_empty() {
@@ -142,8 +161,21 @@ async fn reconcile(
     args: &FetchArgs,
     request: &Request,
 ) -> Result<Outcome> {
+    // Which path a run took is a billing and latency difference, and nothing else in
+    // the output distinguishes them - a user who left `--immediate` off could not tell
+    // whether a job had been queued on the account.
+    info!("batch mode: reconciling against the jobs on the account");
+
     let params = request.submit_params();
     let listing = jobs::all(client).await?;
+
+    // The single most useful thing verbosity had to say was that adoption was attempted
+    // at all, and it was only visible as a vendor span buried in the client's own debug
+    // output. dbnget says it itself.
+    debug!(
+        jobs = listing.len(),
+        "checking whether a job already bought this request"
+    );
 
     if let Some(job) = jobs::find_live(&listing, &params) {
         return match job.state {
@@ -184,6 +216,7 @@ async fn reconcile(
         );
     }
 
+    info!("no job on the account matches this request; pricing a new one");
     let quote = spend::fetch(client, &request.metadata_params()).await?;
     spend::approve(&quote, args.spend)?;
 
@@ -234,6 +267,8 @@ async fn immediate(
     if request.encoding != Encoding::Dbn {
         bail!("--immediate delivers DBN only; drop --format or use the batch path");
     }
+
+    info!("immediate mode: streaming directly, nothing is queued on the account");
 
     tokio::fs::create_dir_all(&args.output)
         .await
@@ -348,10 +383,22 @@ fn claim(path: &Path) -> Result<std::fs::File> {
     verify::no_symlink(path)?;
     std::fs::File::create_new(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::AlreadyExists {
-            anyhow::anyhow!(
-                "{} already exists; move it aside or choose another --output rather than paying for it again",
-                path.display()
-            )
+            // An empty file here is not data. Telling someone they already paid for a
+            // zero-byte husk sends them hunting for a completed job to reuse, which is
+            // a long walk from a file they can simply delete. Only a file with bytes in
+            // it earns the warning about paying twice.
+            let empty = std::fs::metadata(path).is_ok_and(|meta| meta.len() == 0);
+            if empty {
+                anyhow::anyhow!(
+                    "{} already exists and is empty - an abandoned claim from a run that was refused or interrupted, not downloaded data. Delete it and try again.",
+                    path.display()
+                )
+            } else {
+                anyhow::anyhow!(
+                    "{} already exists and holds data; move it aside or choose another --output rather than paying for it again",
+                    path.display()
+                )
+            }
         } else {
             anyhow::Error::new(err).context(format!("claiming {}", path.display()))
         }

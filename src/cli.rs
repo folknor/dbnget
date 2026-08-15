@@ -16,7 +16,8 @@ pub struct Cli {
     #[arg(long, global = true, env = "DATABENTO_API_KEY", hide_env_values = true)]
     pub key: Option<String>,
 
-    /// Increase log verbosity. Repeat for more detail.
+    /// Increase log verbosity: `-v` debug, `-vv` trace, `-vvv` adds the vendor client's
+    /// own logging, which is voluminous.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
@@ -139,6 +140,13 @@ pub struct FetchArgs {
     /// the price, then pass a cap at or above it. There is no "only if free" setting:
     /// nothing the API offers before a submit can tell "covered by a subscription" from
     /// "cheap", so such a flag would be a guess about your money.
+    ///
+    /// You are only charged for a request the account has not already bought. Before
+    /// pricing anything, dbnget checks the vendor's job listing for a job matching this
+    /// exact request - same dataset, schema, symbols, bounds, symbology, format and
+    /// limit - and downloads that instead if it finds one. So re-running a command is
+    /// how you poll it, not how you buy it twice. `dbnget list` shows what is already
+    /// there, and `dbnget get JOB_ID` fetches one by name.
     #[arg(long, value_name = "USD")]
     pub spend: Option<f64>,
 

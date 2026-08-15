@@ -71,6 +71,32 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   turned a real refusal into "quoted $0.00 exceeds the --spend cap of $0.00", which
   asserts that zero exceeds zero and says nothing about what cap would work. Sub-cent
   amounts widen to two significant digits (`$0.00048`); the comparison never widens.
+- **A refusal names the smallest `--spend` that would work, and it rounds UP.** The
+  gate compares exactly, so a suggestion rounded to nearest is refused about half the
+  time it is offered, and advice that does not work is worse than none. It is also the
+  MINIMUM: suggesting a round `$0.01` would ask for twenty times the quote to be
+  authorized for no reason. `minimum_cap` and `money` share one precision rule so the
+  suggested number and the printed price cannot disagree.
+- **`--cost` answers the gate question, not just the price question.** Anyone running
+  it is deciding whether to run the real command; a price read without the verdict says
+  "free" at an amount the very next invocation refuses. It respects a `--spend` passed
+  alongside. The output path is printed only under `--immediate`, because a batch job
+  lands in `OUTPUT/JOB_ID/` and the id does not exist until submit - printing a guess
+  would be inventing one.
+- **Every fetch run states which path it took.** Batch and streaming differ in billing
+  and latency and refuse at the same gate, so without it a refused run leaves the user
+  unable to tell whether a job was queued on the account.
+- **The vendor crate is held back to `info` until `-vvv`.** Its methods are
+  instrumented with the client itself as a span field, so each line at its debug level
+  carries the whole `BatchClient` - `Url` struct fields, proxies, headers - per span:
+  measured at 9.5 KB for one `--cost` run, against 209 bytes of signal. What that noise
+  was being read for, that a job listing was fetched and adoption attempted, dbnget
+  logs itself. Do not surface vendor logging earlier in the ladder to "help debug"; log
+  the thing being debugged instead.
+- **An empty file at an output path is a claim, not data.** Telling someone they
+  already paid for a zero-byte husk sends them looking for a completed job to reuse,
+  which is a long way from a file they can delete. The two cases get different
+  messages, and only a file with bytes in it earns the warning about paying twice.
 - **A $0.00 quote is ambiguous and the record count disambiguates it.** A zero-record
   request is an error, not a free pass. Do not simplify this check away. It applies on
   ADOPTION as well as before a submit: an empty job already on the account is refused
@@ -85,7 +111,16 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   printed as `2022-06-10..2022-06-10` and read as a whole-day job with an inclusive
   end - filed as an end-exclusive matcher bug when the matcher was right. Encoding and
   `limit` were invisible for the same reason. A listing that cannot explain a non-match
-  sends people looking for bugs in the match key.
+  sends people looking for bugs in the match key. The same rule covers the two byte
+  counts: `actual_size` is uncompressed data and `package_size` is the download, they
+  differ by 4-5x on compressed DBN and in the other direction on a handful of small
+  text files, so one unlabelled number gets read as the download and is not it.
+- **`dbnget dataset CODE` carries unit prices, and `list datasets` stays bare codes.**
+  `metadata.list_datasets` returns codes and nothing else - there is no description
+  field to print, and a hand-maintained table of vendor blurbs would rot silently.
+  `metadata.list_unit_prices` is authoritative and per schema, and it is the fact that
+  makes two datasets comparable: `ohlcv-1m` is $12.00 on EQUS.MINI and $35.00 on
+  DBEQ.BASIC. Historical mode only; live is not a mode this tool fetches in.
 - **dbnget is published on crates.io.** The spend gate protects arbitrary users with
   billable keys, not just this account. Hold it to that standard: never weaken, skip,
   or default-bypass it on the grounds that some particular key cannot be charged.
@@ -171,8 +206,8 @@ Detail lives in the code; this is the map.
   symbols, states, formats.
 - `fetch.rs` - the fetch verb and the reconcile-submit-poll-download state machine.
 - `jobs.rs` - the batch-job listing, job matching, and `dbnget list`.
-- `dataset.rs` - `dbnget list datasets` and `dbnget dataset` (range, schemas,
-  `--publishers`, filtered to the one dataset).
+- `dataset.rs` - `dbnget list datasets` and `dbnget dataset` (range, schemas, unit
+  prices, `--publishers`, filtered to the one dataset).
 - `spend.rs` - quoting and the spend gate.
 - `verify.rs` - post-download size + SHA-256 verification against the manifest, the
   zstd frame-header check, and manifest filename validation.

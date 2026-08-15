@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no way to retrieve data the account had already bought.
 - `dbnget list` shows each job's encoding and record limit. Both are part of what a
   request must match to adopt a job, and neither was visible.
+- `dbnget list` gains a header row and a `DOWNLOAD` column. The size shown was the
+  uncompressed data size, which overstates a compressed DBN download by 4-5x; the
+  delivered package size now sits beside it, and both are labelled.
+- `dbnget dataset CODE` shows per-schema unit prices. Two datasets carrying the same
+  symbol can differ several-fold - `ohlcv-1m` is $12.00 per unit on EQUS.MINI and
+  $35.00 on DBEQ.BASIC - and nothing in the tool hinted at it.
+- `--cost` reports whether the spend gate would let the request through, naming the
+  smallest `--spend` value that would be accepted. With `--immediate` it also prints
+  the path it would write.
+- Every fetch run states whether it is streaming or reconciling against the account's
+  batch jobs. The two differ in billing and latency and nothing said which you got.
 
 ### Fixed
 
@@ -30,8 +41,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the next attempt failed with "already exists ... rather than paying for it again"
   about data that was never bought.
 
+- Spend refusals name the smallest `--spend` value that would be accepted, rounded up
+  so the suggestion actually works, and mention that a matching job already on the
+  account is adopted rather than re-bought. Adoption was previously documented only
+  inside the help for the positional symbols argument.
+- `--immediate` distinguishes an abandoned zero-byte claim from a file holding data.
+  The old message told users they had already paid for what was an empty husk left by
+  a refused run.
+
 ### Changed
 
+- `-vv` no longer enables the vendor client's logging; that moves to `-vvv`. Its spans
+  carry the entire client struct on every line, which came to 9.5 KB for a single
+  `--cost` run against 209 bytes of signal. The reconcile steps it was being read for
+  are now logged by dbnget directly.
 - `--spend`'s documentation no longer claims the default fetches what a subscription
   covers. The cost endpoint prices requests with no reference to the account, so
   covered data still quotes a list price and the $0.00 default refuses nearly

@@ -1,7 +1,8 @@
 //! `dbnget dataset` - everything about one dataset, and the dataset listing.
 
 use anyhow::{Context, Result, bail};
-use databento::HistoricalClient;
+use databento::{HistoricalClient, dbn::Schema, historical::metadata::FeedMode};
+use tracing::debug;
 
 use crate::{Outcome, cli::DatasetArgs};
 
@@ -45,7 +46,53 @@ async fn card(client: &mut HistoricalClient, dataset: &str) -> Result<()> {
         .with_context(|| format!("listing schemas for {dataset}"))?;
     let names: Vec<String> = schemas.iter().map(ToString::to_string).collect();
     println!("schemas: {}", names.join(" "));
+
+    prices(client, dataset, &schemas).await;
     Ok(())
+}
+
+/// What each schema costs per unit on this dataset, for the historical feed mode.
+///
+/// This is the only thing that makes two datasets carrying the same symbol comparable
+/// before you buy either. `ohlcv-1m` is $12.00 per unit on EQUS.MINI and $35.00 on
+/// DBEQ.BASIC; nothing else dbnget prints hints at that, and finding it by pricing both
+/// on a hunch is not discovery.
+///
+/// The batch and streaming paths share the historical rate, so one row is the whole
+/// story for anything dbnget can do. The live mode the endpoint also returns is not a
+/// mode this tool fetches in, and printing it would only invite the comparison.
+///
+/// Advisory, like the symbology summary: the dataset card is worth printing without it,
+/// so a failure here is logged and the card stands.
+async fn prices(client: &mut HistoricalClient, dataset: &str, schemas: &[Schema]) {
+    let modes = match client.metadata().list_unit_prices(dataset).await {
+        Ok(modes) => modes,
+        Err(err) => {
+            debug!(%err, "unit prices unavailable for this dataset");
+            return;
+        }
+    };
+    let Some(historical) = modes
+        .iter()
+        .find(|m| matches!(m.mode, FeedMode::Historical))
+    else {
+        return;
+    };
+
+    // Ordered by the dataset's own schema list rather than by the map, so the prices
+    // line up with the `schemas:` row directly above them.
+    let priced: Vec<String> = schemas
+        .iter()
+        .filter_map(|schema| {
+            historical
+                .unit_prices
+                .get(schema)
+                .map(|usd| format!("{schema} {}", crate::spend::money(*usd)))
+        })
+        .collect();
+    if !priced.is_empty() {
+        println!("prices:  {} (USD per unit, historical)", priced.join(", "));
+    }
 }
 
 /// The dataset's publishers: the table that decodes the `publisher_id` field in its

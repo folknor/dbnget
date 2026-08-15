@@ -113,6 +113,14 @@ own code. That lets a shell drive a wave of requests without dbnget tracking the
 submit everything first (the vendor prepares jobs in parallel), then re-run the same
 commands until none exits 3.
 
+### Verbosity
+
+`-v` is dbnget at debug, which is where the reconcile steps are: how many jobs were
+listed, whether one matched, whether anything was priced. `-vv` adds trace. `-vvv` also
+turns on the vendor client's own logging, which is held back that far because its spans
+carry the entire client struct - base URL, proxies, headers - on every line, and it
+drowns everything else several times over. `RUST_LOG` overrides all of them.
+
 ### The spend gate: `--spend`
 
 Without `--spend`, any request with a price above $0.00 is refused with the quote:
@@ -159,18 +167,29 @@ than hiding it behind a generic refusal.
 dbnget ES.v.0 --stype-in continuous -d GLBX.MDP3 -s mbp-1 --start 2024-05-01 --end 2024-06-01 --cost
 ```
 
-Prints the record count, billable size, USD cost and how the symbols resolve, then
-stops. Never queues, and the spend gate does not apply - it is a quote, not a purchase.
-A query matching no records says so, because only the record count tells an empty
-request apart from a cheap one.
+Prints the record count, billable size, USD cost, whether the spend gate would let the
+request through, and how the symbols resolve, then stops. Never queues, and the gate
+does not apply - it is a quote, not a purchase. A query matching no records says so,
+because only the record count tells an empty request apart from a cheap one.
 
 ```
 $ dbnget ES.FUT --stype-in parent -d GLBX.MDP3 -s tbbo --start 2022-06-01 --end 2022-06-30 --cost
 records:       13011614
 billable size: 1040929120 bytes
 cost:          $27.14
+would fetch:   NO - refused by the default $0.00 cap; pass --spend 27.14 to approve it
 symbols:       37 resolved, 5 partial, 0 not found
 ```
+
+The `would fetch` line is the question `--cost` is usually being asked, so it is
+answered outright rather than left to be inferred from a price and a default cap that is
+not on screen. It respects a `--spend` passed alongside it, and the cap it names is the
+quote rounded up - the smallest value that would actually be accepted, rather than a
+round number that authorizes more than the request needs.
+
+With `--immediate`, a `would write` line names the exact output path. The batch path has
+no equivalent: its files land in `OUTPUT/JOB_ID/`, and the job id does not exist until
+the job is submitted.
 
 The `symbols` line is a free symbology lookup, and it says two things the price cannot.
 How far the selection expands: `ES.FUT` is 37 instruments across that month, which is
@@ -201,10 +220,18 @@ that name is an error rather than something to overwrite. Both the destination a
 concurrent runs of the same command cannot both pay, and a filesystem problem surfaces
 while the request is still free. A run that is then refused by the spend gate releases
 both claims on the way out: it charged nothing, so it must not leave behind two empty
-files that make the next run report the data as already paid for. The stream lands on
-the `.part` sibling and is renamed
+files that make the next run report the data as already paid for. If a claim is
+abandoned anyway - a killed process, say - the next run says so in those terms and tells
+you to delete it, rather than describing a payment that never happened. The stream lands
+on the `.part` sibling and is renamed
 only once it completes - there is no manifest to verify an immediate download against,
 so a half-written file must never be left under the final name.
+
+Every run states which path it took - `immediate mode: streaming directly, nothing is
+queued on the account`, or `batch mode: reconciling against the jobs on the account`.
+The two differ in what they bill and how long they take, and both refuse at the same
+gate, so a run that ends in a refusal would otherwise leave you unable to tell whether a
+job had been queued on the account.
 
 There is no session splitting, resume, or empty-day pre-pass here. That machinery
 existed when streaming was the primary path; with batch as the default, the vendor
@@ -240,9 +267,15 @@ what already exists before submitting - a widened `--end` is a new job that
 re-purchases the old range, and dbnget does not warn about overlaps.
 
 ```
-GLBX-20260812-MUCPBX5U6K  Done  GLBX.MDP3  tbbo    continuous:ES.v.0   2025-08-12..2025-08-31   dbn   $0.00  347.8 MiB
-XNAS-20260803-SU6U8HRT75  Done  XNAS.ITCH  ohlcv-1m  raw_symbol:MSFT   2022-06-10T12:30:00..2022-06-10T14:00:00  csv limit:1000   $0.00  8.1 KiB
+JOB ID                    STATE  DATASET    SCHEMA    SYMBOLS            RANGE (UTC)                                OUTPUT          COST      DATA   DOWNLOAD
+GLBX-20260805-HAPEWPABKG  Done   GLBX.MDP3  tbbo      continuous:MNQ.v.0  2026-06-30T22:00:00..2026-07-31T21:00:00  csv            $73.41   4.6 GiB  872.6 MiB
+XNAS-20260803-SU6U8HRT75  Done   XNAS.ITCH  ohlcv-1m  raw_symbol:MSFT     2022-06-10T12:30:00..2022-06-10T14:00:00  csv limit:1000  $0.00   8.1 KiB   10.3 KiB
 ```
+
+`DATA` is the uncompressed record size and `DOWNLOAD` is the package that actually comes
+down the wire - the number to size a disk or a wait against. They are both shown because
+neither predicts the other: compressed DBN packages several times smaller than its data,
+while a job of a few small CSV and JSON files packages slightly larger.
 
 The columns after the range are the fields adoption matches on that are not otherwise
 visible. A job's bounds print as bare dates only when both fall on midnight; anything
@@ -273,14 +306,22 @@ manifest is kept rather than fetched again.
 ## `dbnget dataset` - one dataset's facts
 
 ```sh
-$ dbnget dataset GLBX.MDP3
-range:   2010-06-06 0:00:00.0 +00:00:00 .. 2026-08-13 11:30:00.0 +00:00:00
-schemas: mbo mbp-1 mbp-10 tbbo trades bbo-1s bbo-1m ohlcv-1s ohlcv-1m ohlcv-1h ohlcv-1d definition statistics status
+$ dbnget dataset EQUS.MINI
+range:   2023-03-28 0:00:00.0 +00:00:00 .. 2026-08-15 0:00:00.0 +00:00:00
+schemas: mbp-1 tbbo trades bbo-1s bbo-1m ohlcv-1s ohlcv-1m ohlcv-1h ohlcv-1d definition
+prices:  mbp-1 $1.20, tbbo $6.00, trades $6.00, bbo-1s $4.00, bbo-1m $4.00, ohlcv-1s $12.00, ohlcv-1m $12.00, ohlcv-1h $30.00, ohlcv-1d $30.00, definition $16.00 (USD per unit, historical)
 ```
 
-The two facts needed to turn a dataset code into a fetch command: bounds for
-`--start`/`--end`, and values for `-s`. The names follow the Databento API docs:
-`list datasets` for the many, `dataset` for the one.
+The facts needed to turn a dataset code into a fetch command: bounds for
+`--start`/`--end`, values for `-s`, and what each schema costs per unit. The names follow
+the Databento API docs: `list datasets` for the many, `dataset` for the one.
+
+The `prices` row is what makes two datasets carrying the same symbol comparable before
+you buy either. `ohlcv-1m` is $12.00 per unit here and $35.00 on DBEQ.BASIC, and no
+amount of staring at `list datasets` would tell you that - it lists codes, because codes
+are all the API returns. Prices are for the historical feed mode, which is what both the
+batch and `--immediate` paths draw on. Like the symbology summary, the row is advisory:
+if the endpoint declines, the rest of the card still prints.
 
 `--publishers` shows the dataset's publisher table instead - venue by venue, the
 decoding of the `publisher_id` field in downloaded records. The upstream listing is

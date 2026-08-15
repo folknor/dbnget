@@ -42,6 +42,8 @@ pub async fn list(client: &mut HistoricalClient, args: &ListArgs) -> Result<Outc
         .context("listing batch jobs")?;
     if jobs.is_empty() {
         println!("no jobs");
+    } else {
+        print_header();
     }
     for job in &jobs {
         print_job(job);
@@ -293,13 +295,41 @@ pub async fn download(client: &mut HistoricalClient, job_id: &str, out: &Path) -
 /// How much of the symbol list to show before summarising the rest.
 const SYMBOL_WIDTH: usize = 28;
 
+/// Names the columns, because two of them are byte counts that mean different things
+/// and one of them is the one people size a download by.
+///
+/// Printed only for the listing. A single job echoed back after a submit has nothing to
+/// line up with, and a header over one row is noise.
+fn print_header() {
+    println!(
+        "{id:<24}  {state:<10}  {dataset:<10} {schema:<10} {selection:<34}  {range:<41}  {shape:<16}  {cost:>10}  {size:>9}  {delivered:>9}",
+        id = "JOB ID",
+        state = "STATE",
+        dataset = "DATASET",
+        schema = "SCHEMA",
+        selection = "SYMBOLS",
+        range = "RANGE (UTC)",
+        shape = "OUTPUT",
+        cost = "COST",
+        size = "DATA",
+        delivered = "DOWNLOAD",
+    );
+}
+
 pub fn print_job(job: &BatchJob) {
     let cost = job
         .cost_usd
         .map_or_else(|| "-".to_owned(), crate::spend::money);
+    // Two sizes, because one unlabelled number is read as the download and is not it.
+    // `actual_size` is the uncompressed data; `package_size` is what actually comes
+    // down the wire, and for zstd-compressed DBN that is several times smaller - sizing
+    // a download off the first number overstates it badly. The relationship is not
+    // fixed, though: a job of four small CSV and JSON files packages LARGER than its
+    // contents, so neither number can be derived from the other.
     let size = job.actual_size.map_or_else(|| "-".to_owned(), human_bytes);
+    let delivered = job.package_size.map_or_else(|| "-".to_owned(), human_bytes);
     println!(
-        "{id}  {state:<10}  {dataset:<10} {schema:<10} {selection:<34}  {range:<41}  {shape:<16}  {cost:>10}  {size:>9}",
+        "{id}  {state:<10}  {dataset:<10} {schema:<10} {selection:<34}  {range:<41}  {shape:<16}  {cost:>10}  {size:>9}  {delivered:>9}",
         id = job.id,
         state = format!("{:?}", job.state),
         dataset = job.dataset,

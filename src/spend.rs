@@ -43,25 +43,9 @@ pub fn money(usd: f64) -> String {
     if usd == 0.0 {
         return "$0.00".to_owned();
     }
-    let significant = |s: &str| s.contains(|c: char| c.is_ascii_digit() && c != '0');
-
-    // Two decimals is right whenever it says anything at all.
-    let cents = format!("{usd:.2}");
-    if significant(&cents) {
-        return format!("${cents}");
-    }
-
-    // Below a cent, widen to the first precision that shows a digit and then one
-    // further. The first digit alone rounds: $0.000479 renders as `$0.0005`, which is a
-    // price the request does not have, in the direction that overstates it. A second
-    // significant digit makes it `$0.00048`. Trailing zeroes earned by the extra digit
-    // are dropped again, so `$0.0009` does not become `$0.00090`.
-    for precision in 3..=MAX_PRECISION {
-        if !significant(&format!("{usd:.precision$}")) {
-            continue;
-        }
-        let widened = format!("{usd:.width$}", width = (precision + 1).min(MAX_PRECISION));
-        return format!("${}", widened.trim_end_matches('0'));
+    if let Some(precision) = precision_for(usd) {
+        let rendered = format!("{usd:.precision$}");
+        return format!("${}", trimmed(&rendered));
     }
     // Smaller than the widest fixed rendering can show, but not zero: say so rather
     // than printing a row of zeroes that reads as free.
@@ -71,6 +55,83 @@ pub fn money(usd: f64) -> String {
 /// Where widening stops. Databento quotes to twelve places; past this the digits stop
 /// telling a user anything they can act on, and `--spend` cannot express them anyway.
 const MAX_PRECISION: usize = 8;
+
+/// How many decimals it takes to say something about `usd`, or `None` if even the
+/// widest rendering would be all zeroes.
+///
+/// Two decimals whenever they carry a digit. Below a cent, the first precision that
+/// shows a digit and then one more: the first digit alone rounds, so $0.000479 would
+/// render as `$0.0005`, a price the request does not have, in the direction that
+/// overstates it. A second significant digit makes it `$0.00048`.
+fn precision_for(usd: f64) -> Option<usize> {
+    let significant = |s: &str| s.contains(|c: char| c.is_ascii_digit() && c != '0');
+    if significant(&format!("{usd:.2}")) {
+        return Some(2);
+    }
+    (3..=MAX_PRECISION)
+        .find(|p| significant(&format!("{usd:.p$}")))
+        .map(|p| (p + 1).min(MAX_PRECISION))
+}
+
+/// Drops the trailing zeroes the extra digit of precision earned, so `$0.0009` does not
+/// come out as `$0.00090`. Never eats the decimal point or a whole-cent rendering.
+fn trimmed(rendered: &str) -> &str {
+    match rendered.split_once('.') {
+        Some((_, decimals)) if decimals.len() > 2 => rendered.trim_end_matches('0'),
+        _ => rendered,
+    }
+}
+
+/// The smallest `--spend` value that would let `usd` through, as the user must type it.
+///
+/// Rounded UP at the precision it is rendered to, which is the whole point: the gate
+/// compares exactly, so a suggestion rounded to nearest is refused half the time it is
+/// offered, and nothing is more useless than an error message whose advice does not
+/// work. The suggestion is also the MINIMUM that works - naming a round `0.01` instead
+/// would ask the user to authorize twenty times the quote for no reason.
+pub fn minimum_cap(usd: f64) -> String {
+    let Some(precision) = precision_for(usd) else {
+        // Too small to render, but not zero. There is no shorter honest suggestion than
+        // the smallest amount the rendering can express.
+        return format!("{:.*}", MAX_PRECISION, 1.0 / scale_for(MAX_PRECISION));
+    };
+    let scale = scale_for(precision);
+    let ceiling = (usd * scale).ceil() / scale;
+    trimmed(&format!("{ceiling:.precision$}")).to_owned()
+}
+
+/// Ten to the `precision`, built by multiplication rather than `powi` so no exponent
+/// has to be cast out of the `usize` the formatter wants.
+fn scale_for(precision: usize) -> f64 {
+    let mut scale = 1.0;
+    for _ in 0..precision {
+        scale *= 10.0;
+    }
+    scale
+}
+
+/// Whether `spend` would let this quote through, phrased for a user deciding what to
+/// pass. `--cost` exists to answer exactly this, and answering it with a number the
+/// reader has to compare against a default they cannot see is only half an answer.
+pub fn verdict(quote: &Quote, spend: Option<f64>) -> String {
+    match approve(quote, spend) {
+        Ok(()) => match spend {
+            Some(cap) => format!("yes, within the --spend cap of {}", money(cap)),
+            None => "yes, no --spend needed".to_owned(),
+        },
+        Err(err) if quote.is_empty() => format!("no - {err}"),
+        Err(_) => {
+            let cap = spend.map_or_else(
+                || "the default $0.00 cap".to_owned(),
+                |cap| format!("the --spend cap of {}", money(cap)),
+            );
+            format!(
+                "NO - refused by {cap}; pass --spend {} to approve it",
+                minimum_cap(quote.usd)
+            )
+        }
+    }
+}
 
 impl fmt::Display for Quote {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -149,14 +210,21 @@ pub fn approve(quote: &Quote, spend: Option<f64>) -> Result<()> {
         bail!("--spend must be a finite, non-negative number, not {cap}");
     }
     if quote.usd > cap {
+        // The suggested value is the quote rounded up, not a round number, and the
+        // adoption note is here because this refusal is the moment a user needs it:
+        // being told a price is the moment they wonder whether they already own the
+        // data, and nothing else in the output mentions that re-running adopts.
+        let approve_with = minimum_cap(quote.usd);
         if spend.is_none() {
             bail!(
-                "this request is priced at {} ({quote}); pass --spend USD to approve the charge",
+                "this request is priced at {} ({quote}); pass --spend {approve_with} to approve the charge.\n\
+                 If a job for this exact request already exists on the account, re-running adopts it \
+                 instead of buying again - `dbnget list` shows what is there.",
                 money(quote.usd)
             );
         }
         bail!(
-            "quoted {} exceeds the --spend cap of {}",
+            "quoted {} exceeds the --spend cap of {}; --spend {approve_with} would approve it",
             money(quote.usd),
             money(cap)
         );
@@ -233,6 +301,45 @@ mod tests {
         assert_eq!(money(12.5), "$12.50");
         assert_eq!(money(1234.567), "$1234.57");
         assert_eq!(money(0.01), "$0.01");
+    }
+
+    /// A suggested cap that gets refused is worse than no suggestion, so it rounds up.
+    /// Rounded to nearest, the quote below would suggest `0.00047` and be refused.
+    #[test]
+    fn the_suggested_cap_is_the_smallest_one_that_works() {
+        for usd in [0.000_479_400_158, 0.0009, 12.5, 0.004, 27.135, 1e-12] {
+            let suggested: f64 = minimum_cap(usd).parse().unwrap();
+            assert!(
+                suggested >= usd,
+                "--spend {suggested} would not admit a quote of {usd}"
+            );
+            approve(&quote(usd, 100), Some(suggested)).unwrap();
+        }
+        assert_eq!(minimum_cap(0.000_479_400_158), "0.00048");
+        assert_eq!(minimum_cap(12.5), "12.50");
+    }
+
+    /// The refusal has to name a value that works, and the one a user would guess from
+    /// the printed price is the one that does not.
+    #[test]
+    fn a_refusal_names_a_cap_that_would_be_accepted() {
+        let err = approve(&quote(0.000_479_400_158, 766), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--spend 0.00048"), "{err}");
+        assert!(err.contains("adopts"), "{err}");
+    }
+
+    #[test]
+    fn the_verdict_says_whether_the_gate_would_pass() {
+        assert!(verdict(&quote(0.5, 100), Some(1.0)).starts_with("yes"));
+        assert!(verdict(&quote(0.0, 100), None).starts_with("yes"));
+
+        let refused = verdict(&quote(0.000_479_400_158, 766), None);
+        assert!(refused.contains("--spend 0.00048"), "{refused}");
+
+        let empty = verdict(&quote(0.0, 0), Some(10.0));
+        assert!(empty.starts_with("no"), "{empty}");
     }
 
     /// A price too small for the widest fixed rendering is still not free, and must not

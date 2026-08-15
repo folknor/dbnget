@@ -79,13 +79,21 @@ async fn run() -> Result<Outcome> {
     }
 }
 
-/// `-v` raises this crate to debug, `-vv` turns on debug logging everywhere.
-/// `RUST_LOG`, when set, wins over both.
+/// `-v` raises this crate to debug, `-vv` adds trace, `-vvv` turns on debug logging
+/// everywhere. `RUST_LOG`, when set, wins over all of them.
+///
+/// The vendor crate is held back to `info` until the third `v` on purpose. Its client
+/// methods are instrumented with the client itself as a span field, so every line at
+/// its debug level carries the whole `BatchClient` - base URL exploded into its `Url`
+/// struct, proxies, headers - repeated per span. That was 95% of the bytes at `-vv` and
+/// it buried the 5% worth reading. What people actually wanted from it, that a job
+/// listing was fetched and adoption attempted, dbnget now logs itself.
 fn init_tracing(verbosity: u8) {
     let default = match verbosity {
         0 => "dbnget=info",
         1 => "dbnget=debug",
-        _ => "debug",
+        2 => "dbnget=trace,databento=info",
+        _ => "trace",
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     tracing_subscriber::fmt()
