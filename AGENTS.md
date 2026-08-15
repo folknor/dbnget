@@ -178,11 +178,31 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   requests collide. The symbol segment beside the digest is a READING convenience and is
   sanitized, never validated: a symbol is not obliged to be a legal filename, and
   refusing to fetch `ES:FUT` over how its file would be named would be absurd.
-- **A corrupt batch file is removed before the client is asked for it again.** The
-  client skips any file whose size already matches the manifest, without reading it, so
-  a same-size corrupt file would otherwise fail verification on every retry forever
-  with no recovery but deleting it by hand - for data already paid for. An existing
-  file that verifies is kept and not re-fetched; one that does not is discarded first.
+- **A corrupt batch file is removed before the client is asked for it again, but a
+  SHORT one is not.** The client compares length against the manifest: shorter means
+  resume with a Range request, equal means skip without reading, longer is an error. So
+  a same-size corrupt file must be deleted or it fails verification on every retry
+  forever, with no recovery but deleting it by hand - for data already paid for. A
+  short file must NOT be deleted: doing so threw away every byte of an interrupted
+  transfer, and on a multi-gigabyte job that can mean never finishing. A short file with
+  a corrupt prefix self-heals in two runs - the resume completes it, verification fails
+  at full length, and the next run deletes it as a length-matching corrupt file.
+- **A download holds an exclusive claim on `OUT/JOB_ID/`, and this is what makes resume
+  safe.** Without it, "shorter than the manifest" is ambiguous between "interrupted" and
+  "another run is writing it right now", and the vendor client writes straight to the
+  final path with no temporary file, so two concurrent runs interleave into one file.
+  The claim is an ADVISORY LOCK (`fs4`), not an exclusively-created marker file, because
+  the operating system releases it when the process dies - crash, panic or `SIGKILL`
+  alike. A marker file needs a recorded pid and a liveness check, and goes stale exactly
+  here, on the operation most likely to be interrupted. The `.dbnget-lock` file is left
+  behind on purpose; its existence is not the lock, so there is nothing to clean up.
+  The lock is per output directory, never machine-global: a global lock would serialize
+  every dbnget run and destroy the documented fan-out workflow. Contention exits 3
+  rather than blocking, because the wait would be bounded by someone else's
+  multi-gigabyte transfer. The lock file's name is RESERVED against the manifest:
+  vendor filenames are untrusted input joined into the same directory, so a job
+  delivering `.dbnget-lock` would be downloaded onto the lock itself, and it is refused
+  instead. No real job carries that name, which is exactly why refusing costs nothing.
 - **Filename validation is the union of platform rules, not the running platform's.**
   The crate is not declared Unix-only. Colons, the Windows-illegal punctuation, control
   characters, trailing dots and spaces, and reserved device names like `CON` and `NUL`
@@ -228,7 +248,9 @@ Detail lives in the code; this is the map.
   instants, the half-open range (a bare `--start` covers exactly that UTC day),
   symbols, states, formats.
 - `fetch.rs` - the fetch verb and the reconcile-submit-poll-download state machine.
-- `jobs.rs` - the batch-job listing, job matching, and `dbnget list`.
+- `jobs.rs` - the batch-job listing, job matching, `dbnget list`, and the verified
+  download.
+- `lock.rs` - the exclusive claim on an output directory, held for a download.
 - `dataset.rs` - `dbnget list datasets` and `dbnget dataset` (range, schemas, unit
   prices, `--publishers`, filtered to the one dataset).
 - `spend.rs` - quoting and the spend gate.

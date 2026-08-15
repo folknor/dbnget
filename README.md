@@ -285,6 +285,25 @@ each verified before the next one starts. The client's download-all re-fetches t
 manifest internally and builds paths from that second copy, so the names checked would
 not be the names written.
 
+An interrupted download resumes. A file shorter than the manifest says is kept and
+continued from where it stopped, rather than deleted and fetched again from nothing -
+which on a multi-gigabyte job could mean never finishing. A file that is already the
+right length but fails its checksum is still discarded and re-fetched, because the
+client skips a length-matching file without reading it, so corruption there would
+survive every retry. If a short file's existing bytes turn out to be corrupt, the resume
+completes it and the next run discards it under that same rule: two runs, no manual
+intervention.
+
+While it downloads, a run holds an exclusive lock on `OUT/JOB_ID/`, recorded in a
+`.dbnget-lock` file there. A second run finding the directory held says so and exits 3
+rather than waiting, since the wait would be however long someone else's download takes
+and exit 3 already means "not finished, come back". This is what makes resuming safe: a
+short file can only be an interrupted transfer, never one in progress elsewhere. The
+lock is an advisory lock held by the open file, so the operating system releases it when
+the process ends - including on a crash or a kill. The `.dbnget-lock` file is left
+behind and re-used; its presence is not a held lock, so there is never a stale lock to
+clear by hand.
+
 ## `dbnget list`
 
 ```sh

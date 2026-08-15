@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Every fetch run states whether it is streaming or reconciling against the account's
   batch jobs. The two differ in billing and latency and nothing said which you got.
 
+- Interrupted downloads resume. A file shorter than the manifest is now continued from
+  where it stopped rather than deleted and fetched again from zero, which on a
+  multi-gigabyte job could mean never completing. A file of the right length that fails
+  its checksum is still discarded, since the client would otherwise skip it unread.
+- A download holds an exclusive lock on `OUT/JOB_ID/`. Concurrent runs previously both
+  wrote into the same directory, and the client writes straight to the final path with
+  no temporary file, so their writes could interleave. A run that finds the directory
+  held reports it and exits 3 instead of waiting. The lock is released by the operating
+  system when the process ends, so an interrupted download never leaves one stuck.
+
 ### Fixed
 
 - Prices are printed so that the figure shown is never lower than the real price and is

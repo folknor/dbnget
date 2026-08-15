@@ -10,9 +10,9 @@ use databento::{
     historical::batch::{BatchJob, DownloadParams, JobState, ListJobsParams, SubmitJobParams},
 };
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
-use tracing::warn;
+use tracing::{info, warn};
 
-use crate::{Outcome, cli::ListArgs, query, verify};
+use crate::{Outcome, cli::ListArgs, lock, query, verify};
 
 /// `dbnget list` - the vendor's job listing is the only account of what was bought,
 /// and this is the user's tool for checking it before submitting.
@@ -234,11 +234,35 @@ pub async fn download(client: &mut HistoricalClient, job_id: &str, out: &Path) -
     }
     for file in &manifest {
         verify::checked_file_name(&file.filename)?;
+        // The download claims this directory with a lock file of its own, and manifest
+        // names are joined into that same directory. A job delivering a file by that
+        // name would be downloaded straight onto the lock.
+        if lock::is_lock_file(&file.filename) {
+            bail!(
+                "job {job_id} delivers a file named `{}`, which is the name dbnget uses to lock an output directory; refusing rather than writing data onto it",
+                file.filename
+            );
+        }
     }
 
     // The client puts a job's files in a directory named after the job.
     let job_dir = out.join(job_id);
     verify::no_symlink(&job_dir)?;
+    tokio::fs::create_dir_all(&job_dir)
+        .await
+        .with_context(|| format!("creating job directory {}", job_dir.display()))?;
+
+    // Held for the whole download. Two runs writing one file is not hypothetical here:
+    // the documented way to use this tool is to re-run the same command until it stops
+    // exiting 3, and a long download overlapping the next poll is exactly what that
+    // produces. The claim is what lets an incomplete file below be read as "interrupted"
+    // rather than "in progress elsewhere".
+    let Some(_claim) = lock::try_claim(&job_dir)? else {
+        println!(
+            "{job_id} is being downloaded by another dbnget right now; re-run once it finishes"
+        );
+        return Ok(Outcome::Nonterminal);
+    };
 
     // One file at a time, from the manifest validated above. Handing the whole job to
     // the client's download-all instead would re-fetch the manifest inside it and build
@@ -253,13 +277,27 @@ pub async fn download(client: &mut HistoricalClient, job_id: &str, out: &Path) -
         // An already-good file is done: say so and move on without asking the vendor
         // for bytes the disk already holds.
         //
-        // A file that is present and BAD has to be removed before the client is asked
-        // for it, because the client skips any file whose size already matches the
-        // manifest without reading or re-fetching it. A corrupt file of the right
-        // length therefore survives every retry: dbnget rejects it, the next run asks
-        // for it again, the client declines to fetch it, and the same failure repeats
-        // forever with no way out but deleting the file by hand - for data that has
-        // already been paid for.
+        // A file that is present and bad is either incomplete or corrupt, and the two
+        // call for opposite treatment. The client compares a file's length against the
+        // manifest: shorter means resume from that offset with a Range request, equal
+        // means skip it without reading, longer is an error.
+        //
+        // So a SHORT file is left exactly where it is. Deleting it threw away every byte
+        // of an interrupted transfer and started again from nothing, which on a
+        // multi-gigabyte job can mean never finishing at all. The claim taken above is
+        // what makes "short" safe to read as "interrupted": nothing else can be writing
+        // here, so it cannot mean "in progress elsewhere".
+        //
+        // A file whose length already MATCHES has to be removed, because the client
+        // skips it without reading and the corruption would survive every retry: dbnget
+        // rejects it, the next run asks for it again, the client declines to fetch it,
+        // and the same failure repeats forever with no way out but deleting the file by
+        // hand - for data that has already been paid for. A longer-than-expected file
+        // goes for the same reason; the client refuses to touch it at all.
+        //
+        // A short file whose existing bytes are corrupt is not a trap either: the resume
+        // completes it, verification fails at full length, and the next run deletes it
+        // under the rule above. Two runs, no manual intervention.
         if tokio::fs::try_exists(&path)
             .await
             .with_context(|| format!("checking for {}", path.display()))?
@@ -270,10 +308,23 @@ pub async fn download(client: &mut HistoricalClient, job_id: &str, out: &Path) -
                     continue;
                 }
                 Err(err) => {
-                    warn!(path = %path.display(), %err, "discarding a bad file and fetching it again");
-                    tokio::fs::remove_file(&path)
+                    let have = tokio::fs::metadata(&path)
                         .await
-                        .with_context(|| format!("removing the corrupt {}", path.display()))?;
+                        .with_context(|| format!("measuring {}", path.display()))?
+                        .len();
+                    if have < desc.size {
+                        info!(
+                            path = %path.display(),
+                            have,
+                            want = desc.size,
+                            "resuming an interrupted download"
+                        );
+                    } else {
+                        warn!(path = %path.display(), %err, "discarding a bad file and fetching it again");
+                        tokio::fs::remove_file(&path)
+                            .await
+                            .with_context(|| format!("removing the corrupt {}", path.display()))?;
+                    }
                 }
             }
         }

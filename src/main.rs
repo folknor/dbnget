@@ -2,6 +2,7 @@ mod cli;
 mod dataset;
 mod fetch;
 mod jobs;
+mod lock;
 mod query;
 mod spend;
 mod verify;
