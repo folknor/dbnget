@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Delete it whenever you like. It rebuilds itself.
 
+- `dbnget list` gains `--format`: `table` (default), `json`, `ndjson`, `csv`,
+  `markdown` and `ids`. Only the table abbreviates anything - every other format
+  writes the complete symbol list, because a truncation that helps in a column is a
+  silent data loss in a file another program parses. CSV is RFC 4180 with a header
+  row, so a comma-joined symbol list stays one quoted column rather than becoming
+  sixty-three extra ones. `ids` prints bare job ids for `xargs -n1 dbnget get`.
+- `dbnget list --limit N` shows only the most recent N jobs, and applies the cap
+  before fetching anything. The vendor returns every job in one response and offers
+  no limit of its own, so the cost of a listing is one detail request per row - and
+  this is where that cost is decided. On an account of 472 jobs, `--limit 3` is four
+  requests instead of 473.
+
 ### Changed
 
 - The vendor client moves to `databento` 0.60 (DBN 0.68) and hashing to `sha2`

@@ -202,6 +202,43 @@ pub struct ListArgs {
     /// Only show jobs submitted on or after this date (`YYYY-MM-DD` or RFC 3339).
     #[arg(long)]
     pub since: Option<String>,
+
+    /// How to render the listing.
+    #[arg(long, short = 'f', default_value = "table")]
+    pub format: ListFormat,
+
+    /// Show only the most recent N jobs.
+    ///
+    /// This is the flag that makes the command usable on an account with a long
+    /// history. The vendor's listing has no limit of its own and returns every job in
+    /// one response, but the details behind each row cost a request apiece - so
+    /// capping here caps the work, rather than trimming a list that was already paid
+    /// for.
+    #[arg(long, short = 'n')]
+    pub limit: Option<usize>,
+}
+
+/// How `dbnget list jobs` writes its output.
+///
+/// Only `Table` abbreviates anything. Truncation is a reading convenience and a data
+/// corruption: a symbol list cut to `+61 more` helps in a column and is a silent loss in
+/// something another program parses. That is not enforced by a flag here but by the
+/// rendering itself - the table is the only path that summarises a symbol list, and
+/// every other format writes the whole one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ListFormat {
+    /// Aligned columns for reading, truncated to fit.
+    Table,
+    /// One JSON array of complete job records.
+    Json,
+    /// One complete JSON job record per line, for streaming and `jq`.
+    Ndjson,
+    /// RFC 4180, with a header row.
+    Csv,
+    /// A pipe table, for pasting into an issue or a document.
+    Markdown,
+    /// Bare job ids, one per line, for `xargs -n1 dbnget get`.
+    Ids,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

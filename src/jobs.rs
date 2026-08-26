@@ -28,7 +28,6 @@ use crate::{
 pub(crate) mod fixtures;
 mod render;
 
-use render::print_header;
 pub use render::print_job;
 
 /// `dbnget list` - the vendor's job listing is the only account of what was bought,
@@ -61,7 +60,7 @@ pub async fn list(
     // use to work out WHY a request did not adopt an existing job, so a stale field
     // here sends someone hunting a matcher bug that does not exist. A hint is not
     // allowed to answer a diagnostic question.
-    let jobs = listed_details(client, key, &params)
+    let jobs = listed_details(client, key, &params, args.limit)
         .await
         .context("listing batch jobs")?;
     // Every row here was just fetched live, which is exactly what an index entry is
@@ -71,14 +70,7 @@ pub async fn list(
         cache.put(job);
     }
 
-    if jobs.is_empty() {
-        println!("no jobs");
-    } else {
-        print_header();
-    }
-    for job in &jobs {
-        print_job(job);
-    }
+    render::print_listing(&jobs, args.format)?;
     Ok(Outcome::Settled)
 }
 
@@ -309,9 +301,27 @@ async fn listed_details(
     client: &mut HistoricalClient,
     key: &str,
     params: &ListJobsParams,
+    limit: Option<usize>,
 ) -> Result<Vec<BatchJob>> {
     let short = short_listing(client, params).await?;
-    let ids: Vec<String> = short.into_iter().map(|entry| entry.id).collect();
+    let mut ids: Vec<String> = short.into_iter().map(|entry| entry.id).collect();
+
+    // Applied BEFORE the fan-out, which is the only reason the flag is worth having.
+    // The vendor returns every job in one response with no limit of its own, so
+    // trimming afterwards would save nothing - the cost is one detail request per row,
+    // and this is where that cost is decided. The vendor sorts by received-time, so the
+    // most recent jobs are the tail, and those are the ones anyone means by "the last
+    // twenty".
+    if let Some(limit) = limit
+        && ids.len() > limit
+    {
+        debug!(
+            total = ids.len(),
+            limit, "showing only the most recent jobs"
+        );
+        ids.drain(..ids.len() - limit);
+    }
+
     details_many("reading jobs", key, &ids).await
 }
 

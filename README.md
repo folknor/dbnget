@@ -217,6 +217,8 @@ default path, the vendor does the splitting.
 ```sh
 dbnget list                           # the batch jobs on the account
 dbnget list --state queued,processing
+dbnget list --limit 20                # only the most recent 20
+dbnget list --format json             # or ndjson, csv, markdown, ids
 dbnget list datasets                  # the datasets the account can access
 ```
 
@@ -252,7 +254,31 @@ dbnget always submits zstd compression and one file per day, and offers no flag 
 and its row stays quiet. A job created in the vendor's web UI can, and used to look
 identical to an adoptable one while refusing to be adopted.
 
-Long symbol lists are truncated with a count of what was left out.
+Long symbol lists are truncated with a count of what was left out, so a 63-symbol
+`parent` selection reads `parent:ES.FUT,MES.FUT +61 more` rather than taking the rest of
+the row with it.
+
+### Formats, and keeping the listing cheap
+
+```sh
+dbnget list --limit 20                  # only the 20 most recent
+dbnget list --format json               # complete records, nothing abbreviated
+dbnget list --format csv > jobs.csv
+dbnget list --format ids | xargs -n1 dbnget get
+```
+
+`--format` takes `table` (the default), `json`, `ndjson`, `csv`, `markdown` and `ids`.
+
+**Only the table abbreviates.** Every other format writes the whole symbol list and the
+full record, because a truncation that helps in a column is a silent data loss in a file
+something else is going to parse. CSV is RFC 4180 with a header row, so the comma-joined
+symbol list stays one quoted column instead of becoming sixty-three extra ones.
+
+`--limit N` matters more than it looks. The vendor returns every job on the account in a
+single response and offers no limit of its own, but the details behind each row cost one
+request apiece - so a listing's cost is the number of ROWS, and `--limit` is where that
+is decided. On an account with 472 jobs, `--limit 3` is four requests rather than 473.
+It keeps the most recent N, since the vendor sorts by submission time.
 
 ## `dbnget get JOB_ID` - download a job by name
 

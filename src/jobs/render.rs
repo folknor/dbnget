@@ -9,9 +9,11 @@ use databento::{
     Symbols,
     historical::batch::{BatchJob, Delivery},
 };
+use serde::Serialize;
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 
 use super::{SUBMITTED_COMPRESSION, SUBMITTED_SPLIT_DURATION, text_encoding_default};
+use crate::cli::ListFormat;
 
 /// The whole width the selection cell is allowed, symbology prefix included.
 ///
@@ -19,6 +21,270 @@ use super::{SUBMITTED_COMPRESSION, SUBMITTED_SPLIT_DURATION, text_encoding_defau
 /// of what has to fit, and sizing only the list let `parent:` push the cell past its
 /// column and shove every column after it out of alignment.
 const SELECTION_WIDTH: usize = 34;
+
+/// A job flattened for a machine to read: every field, nothing abbreviated.
+///
+/// Separate from the table because the two have opposite obligations. The table exists
+/// to be legible in a fixed width and abbreviates to get there; this exists to be
+/// complete, so the symbol list is the whole list and every timestamp is RFC 3339 rather
+/// than the eye-friendly form the columns use.
+///
+/// Built as a struct literal from `BatchJob` for the same reason the matcher's fixtures
+/// are: a field added upstream shows up as a compile error here, which is the moment to
+/// decide whether machine consumers should see it.
+#[derive(Debug, Serialize)]
+pub(super) struct JobRow {
+    id: String,
+    state: String,
+    dataset: String,
+    schema: String,
+    symbols: Vec<String>,
+    stype_in: String,
+    stype_out: String,
+    #[serde(with = "time::serde::rfc3339")]
+    start: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    end: OffsetDateTime,
+    limit: Option<u64>,
+    encoding: String,
+    compression: String,
+    split_duration: String,
+    split_size: Option<u64>,
+    split_symbols: bool,
+    delivery: String,
+    pretty_px: bool,
+    pretty_ts: bool,
+    map_symbols: bool,
+    cost_usd: Option<f64>,
+    record_count: Option<u64>,
+    billed_size: Option<u64>,
+    actual_size: Option<u64>,
+    package_size: Option<u64>,
+    progress: Option<u8>,
+    #[serde(with = "time::serde::rfc3339")]
+    ts_received: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    ts_queued: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    ts_process_start: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    ts_process_done: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    ts_expiration: Option<OffsetDateTime>,
+}
+
+impl JobRow {
+    fn new(job: &BatchJob) -> Self {
+        Self {
+            id: job.id.clone(),
+            state: spelled(job.state),
+            dataset: job.dataset.clone(),
+            schema: job.schema.to_string(),
+            // The whole list, comma-joined echoes split apart. A machine format that
+            // reported one 400-character pseudo-symbol would be worse than useless.
+            symbols: symbol_names(&job.symbols),
+            stype_in: job.stype_in.to_string(),
+            stype_out: job.stype_out.to_string(),
+            start: job.start,
+            end: job.end,
+            limit: job.limit.map(std::num::NonZeroU64::get),
+            encoding: job.encoding.to_string(),
+            compression: job.compression.to_string(),
+            split_duration: spelled(job.split_duration),
+            split_size: job.split_size.map(std::num::NonZeroU64::get),
+            split_symbols: job.split_symbols,
+            delivery: spelled(job.delivery),
+            pretty_px: job.pretty_px,
+            pretty_ts: job.pretty_ts,
+            map_symbols: job.map_symbols,
+            cost_usd: job.cost_usd,
+            record_count: job.record_count,
+            billed_size: job.billed_size,
+            actual_size: job.actual_size,
+            package_size: job.package_size,
+            progress: job.progress,
+            ts_received: job.ts_received,
+            ts_queued: job.ts_queued,
+            ts_process_start: job.ts_process_start,
+            ts_process_done: job.ts_process_done,
+            ts_expiration: job.ts_expiration,
+        }
+    }
+
+    /// The CSV column order, matching [`CSV_HEADER`]. Sizes and counts stay raw rather
+    /// than scaled - a spreadsheet can divide, and `1.3 GiB` cannot be summed.
+    fn csv_fields(&self) -> Vec<String> {
+        fn opt<T: ToString>(v: Option<T>) -> String {
+            v.map(|x| x.to_string()).unwrap_or_default()
+        }
+        vec![
+            self.id.clone(),
+            self.state.clone(),
+            self.dataset.clone(),
+            self.schema.clone(),
+            self.symbols.join(","),
+            self.stype_in.clone(),
+            self.stype_out.clone(),
+            rfc3339(self.start),
+            rfc3339(self.end),
+            opt(self.limit),
+            self.encoding.clone(),
+            self.compression.clone(),
+            self.split_duration.clone(),
+            opt(self.split_size),
+            self.split_symbols.to_string(),
+            self.delivery.clone(),
+            self.pretty_px.to_string(),
+            self.pretty_ts.to_string(),
+            self.map_symbols.to_string(),
+            opt(self.cost_usd),
+            opt(self.record_count),
+            opt(self.billed_size),
+            opt(self.actual_size),
+            opt(self.package_size),
+            opt(self.progress),
+            rfc3339(self.ts_received),
+            self.ts_queued.map(rfc3339).unwrap_or_default(),
+            self.ts_process_start.map(rfc3339).unwrap_or_default(),
+            self.ts_process_done.map(rfc3339).unwrap_or_default(),
+            self.ts_expiration.map(rfc3339).unwrap_or_default(),
+        ]
+    }
+}
+
+const CSV_HEADER: [&str; 30] = [
+    "id",
+    "state",
+    "dataset",
+    "schema",
+    "symbols",
+    "stype_in",
+    "stype_out",
+    "start",
+    "end",
+    "limit",
+    "encoding",
+    "compression",
+    "split_duration",
+    "split_size",
+    "split_symbols",
+    "delivery",
+    "pretty_px",
+    "pretty_ts",
+    "map_symbols",
+    "cost_usd",
+    "record_count",
+    "billed_size",
+    "actual_size",
+    "package_size",
+    "progress",
+    "ts_received",
+    "ts_queued",
+    "ts_process_start",
+    "ts_process_done",
+    "ts_expiration",
+];
+
+fn rfc3339(t: OffsetDateTime) -> String {
+    t.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| t.unix_timestamp().to_string())
+}
+
+/// Writes the whole listing in `format`.
+pub(super) fn print_listing(jobs: &[BatchJob], format: ListFormat) -> anyhow::Result<()> {
+    match format {
+        ListFormat::Table => {
+            if jobs.is_empty() {
+                println!("no jobs");
+                return Ok(());
+            }
+            print_header();
+            for job in jobs {
+                print_job(job);
+            }
+        }
+        // No "no jobs" line for the machine formats: an empty array, no lines, or a
+        // header alone are all correct and parseable, and a prose sentence on stdout
+        // would break whatever is reading them.
+        ListFormat::Json => {
+            let rows: Vec<JobRow> = jobs.iter().map(JobRow::new).collect();
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        }
+        ListFormat::Ndjson => {
+            for job in jobs {
+                println!("{}", serde_json::to_string(&JobRow::new(job))?);
+            }
+        }
+        ListFormat::Csv => {
+            println!("{}", csv_record(&CSV_HEADER.map(ToOwned::to_owned)));
+            for job in jobs {
+                println!("{}", csv_record(&JobRow::new(job).csv_fields()));
+            }
+        }
+        ListFormat::Markdown => print_markdown(jobs),
+        ListFormat::Ids => {
+            for job in jobs {
+                println!("{}", job.id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One RFC 4180 record.
+///
+/// A field is quoted when it holds a comma, a quote, a newline or a carriage return, and
+/// inner quotes are doubled. The symbols column is comma-joined and so is always quoted,
+/// which is precisely why this follows the rule rather than eyeballing it - a bare
+/// comma-joined symbol list would silently become 63 extra columns.
+fn csv_record(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|field| {
+            if field.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", field.replace('"', "\"\""))
+            } else {
+                field.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A pipe table. Pipes inside a cell are escaped, since a raw one would split it.
+fn print_markdown(jobs: &[BatchJob]) {
+    const COLUMNS: [&str; 8] = [
+        "Job ID",
+        "State",
+        "Dataset",
+        "Schema",
+        "Symbols",
+        "Range (UTC)",
+        "Output",
+        "Download",
+    ];
+    println!("| {} |", COLUMNS.join(" | "));
+    println!(
+        "|{}|",
+        COLUMNS.iter().map(|_| "---").collect::<Vec<_>>().join("|")
+    );
+    for job in jobs {
+        let cells = [
+            job.id.clone(),
+            spelled(job.state),
+            job.dataset.clone(),
+            job.schema.to_string(),
+            // Full list: markdown is read by people but stored as text, and a reader can
+            // scroll a wide cell where they cannot recover a truncated one.
+            format!("{}:{}", job.stype_in, symbol_names(&job.symbols).join(",")),
+            range(job),
+            shape(job),
+            job.package_size.map_or_else(|| "-".to_owned(), human_bytes),
+        ];
+        let escaped: Vec<String> = cells.iter().map(|c| c.replace('|', "\\|")).collect();
+        println!("| {} |", escaped.join(" | "));
+    }
+}
 
 /// Names the columns, because two of them are byte counts that mean different things
 /// and one of them is the one people size a download by.
@@ -272,7 +538,8 @@ mod tests {
     use time::macros::datetime;
 
     use super::{
-        SELECTION_WIDTH, human_bytes, range, selection, shape, summarize_symbols, symbol_names,
+        CSV_HEADER, JobRow, SELECTION_WIDTH, csv_record, human_bytes, range, selection, shape,
+        summarize_symbols, symbol_names,
     };
     use crate::jobs::{
         fixtures::{job_from, params},
@@ -462,6 +729,72 @@ mod tests {
         }));
         assert_eq!(range(&early), "2022-06-10T12:30:00.1..2022-06-10T14:00:00");
         assert_ne!(range(&early), range(&late));
+    }
+
+    /// The rule that keeps a symbol list from becoming 63 extra columns.
+    #[test]
+    fn csv_quotes_fields_that_would_otherwise_break_the_record() {
+        let record = csv_record(&[
+            "plain".to_owned(),
+            "ES.FUT,MES.FUT".to_owned(),
+            "say \"hi\"".to_owned(),
+            "two\nlines".to_owned(),
+        ]);
+        assert_eq!(
+            record,
+            "plain,\"ES.FUT,MES.FUT\",\"say \"\"hi\"\"\",\"two\nlines\""
+        );
+    }
+
+    /// Every column has a header, or a consumer lines the wrong data up under the wrong
+    /// name - which is worse than failing, because it parses.
+    #[test]
+    fn the_csv_header_matches_the_row_width() {
+        let job = job_from(&params(|_| {}));
+        assert_eq!(JobRow::new(&job).csv_fields().len(), CSV_HEADER.len());
+    }
+
+    /// A machine format must never abbreviate. The table cuts a 63-symbol list down to
+    /// fit a column; JSON and CSV have to carry every one of them.
+    #[test]
+    fn machine_formats_carry_the_whole_symbol_list() {
+        let sixty_three: Vec<String> = (0..63).map(|i| format!("SYM{i:02}.FUT")).collect();
+        let job = job_from(&params(|p| {
+            // The vendor's comma-joined echo, which is what actually arrives.
+            p.symbols = Symbols::Symbols(vec![sixty_three.join(",")]);
+        }));
+
+        let row = JobRow::new(&job);
+        assert_eq!(
+            row.symbols.len(),
+            63,
+            "the echo must be split, not truncated"
+        );
+
+        let fields = row.csv_fields();
+        let symbols_column = &fields[4];
+        assert!(
+            symbols_column.contains("SYM62.FUT"),
+            "the last symbol is missing"
+        );
+        assert!(
+            !symbols_column.contains("more"),
+            "a machine format must not abbreviate"
+        );
+
+        // And the table, for contrast, still abbreviates.
+        assert!(selection(&job).contains("more"));
+    }
+
+    /// Markdown is read by people but stored as text, so a raw pipe inside a cell would
+    /// silently split the row.
+    #[test]
+    fn markdown_escapes_pipes_in_cells() {
+        let job = job_from(&params(|p| {
+            p.symbols = Symbols::Symbols(vec!["WEIRD|SYMBOL".to_owned()]);
+        }));
+        let cells = format!("{}:{}", job.stype_in, symbol_names(&job.symbols).join(","));
+        assert!(cells.replace('|', "\\|").contains("WEIRD\\|SYMBOL"));
     }
 
     #[test]

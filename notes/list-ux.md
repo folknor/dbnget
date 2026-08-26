@@ -19,9 +19,40 @@ Everything depends on one fact nobody has measured yet:
 Even 5,000 is fatal for the current shape: `dbnget list` and the pre-submit sweep both
 fetch details for every job, one request each.
 
+Note what the API section below establishes: the SHORT listing is one request whatever
+the count, so this is a fan-out problem and not a listing problem. `dbnget list` is
+therefore fixable with a limit alone. The sweep is not, because "no job matches" is a
+claim about a real subset of the account rather than a display choice, and no `--limit`
+is legitimate there.
+
 This cannot be measured on the development account yet - it is two weeks old, all 472
 jobs are `Done`, and nothing has aged out. `--state expired` returns nothing. MEASURE
 THIS FIRST. It decides whether the work below is a redesign or a rewrite.
+
+## What the API actually offers
+
+From the vendor documentation for `batch.list_jobs`, confirmed against the client
+source. Two endpoints on `https://hist.databento.com/v0/`, HTTP Basic with the key as
+username:
+
+- `GET batch.list_jobs` - parameters are `states`, `since` and `short`, and THAT IS ALL.
+  No dataset, schema or symbol filter. No `until`. **No limit and no pagination.**
+  Results are sorted by `ts_received`. `states` defaults to all except `expired`.
+- `GET batch.get_job_details?job_id=...` - one call per job, returns the full record.
+
+Three consequences, and the third is the important one:
+
+1. Regex selectors can only ever be CLIENT-side. They cannot reduce what the vendor
+   sends, only which jobs get a detail fetch - which is exactly why resolving them
+   against the request index matters.
+2. `--limit` is a local truncation. It cannot save a round trip on the listing, only on
+   the fan-out.
+3. **The short listing is ONE request at any account size.** At 310,000 jobs that is a
+   single response of roughly 30MB - large, not fatal. So the scaling problem was never
+   the listing. It is only ever the detail fan-out, and that is entirely ours to control.
+
+That reframes the expiry question below. It decides how big one JSON response gets, not
+whether the tool works.
 
 ## The architectural half
 
@@ -158,11 +189,18 @@ four fields above cover what anyone actually asks of a job list.
 
 ## Order of work
 
-1. **Measure the expiry question.** Everything else is contingent on it.
-2. Table truncation and `--wide`. Smallest change, fixes the worst-looking defect.
-3. `--format` with `json`, `ndjson`, `markdown`, `ids`.
-4. Bounded default and `--limit`.
+1. ~~Table truncation.~~ DONE. The cause was not a missing feature: the summariser
+   existed and never fired, because the vendor echoes a multi-symbol selection as one
+   comma-joined string and the display path never split it.
+2. ~~`--format` with `json`, `ndjson`, `csv`, `markdown`, `ids`.~~ DONE.
+3. ~~`--limit`.~~ DONE, and it is what makes `list` scale: 4 requests instead of 473 on
+   a 472-job account.
+4. `--wide` to defeat table truncation. Not yet done.
 5. Regex selectors resolved against the index.
 6. Paging.
-7. The sweep relaxation - LAST, and only after a spar, because it is the only item here
-   that touches whether money can be spent twice.
+7. The bounded DEFAULT - still undecided between state-based and time-based, and less
+   urgent now that `--limit` exists.
+8. **Measure the expiry question.** Demoted: since the short listing is one request at
+   any size, this decides how large one response gets, not whether the tool works.
+9. The sweep relaxation - LAST, and only after a spar. The only item here that touches
+   whether money can be spent twice, and the only one `--limit` cannot help with.
