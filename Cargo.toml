@@ -31,11 +31,16 @@ exclude = [
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 databento = "0.60.0"
+# Locates the platform's cache directory, which on Linux honours `XDG_CACHE_HOME`.
+# Only ever used for the request index, which is a hint and never authoritative.
+dirs = "6"
 # Cross-platform advisory file locking. The lock has to be released by the operating
 # system when the process dies, because a download is exactly the thing that gets
 # interrupted - anything we would have to clean up ourselves goes stale on the one path
 # where staleness is guaranteed to happen.
 fs4 = "1.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.11"
 time = { version = "0.3", features = ["macros", "parsing", "formatting"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }

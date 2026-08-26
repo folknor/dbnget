@@ -7,19 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A request index under the platform cache directory - `~/.cache/dbnget` on Linux,
+  honouring `XDG_CACHE_HOME`. It records which request each job on the account was
+  submitted with, so a re-run can go straight to the job that already bought the
+  data instead of asking the vendor about every job it has.
+
+  It is a hint and never an authority. A job is only ever adopted after the vendor
+  confirms it live, and nothing is ever submitted until a complete live sweep of the
+  account has found no match, so a stale, corrupt, hostile or absent index cannot
+  cause the same data to be bought twice. If the directory cannot be created, made
+  private, or read, the index is silently disabled and the command works exactly as
+  it would have without it. It holds no credential and no costs or sizes, only which
+  request belongs to which job id, and it is written user-private.
+
+  Delete it whenever you like. It rebuilds itself.
+
 ### Changed
 
 - The vendor client moves to `databento` 0.60 (DBN 0.68) and hashing to `sha2`
-  0.11. No dbnget behavior changes: the job-matching fixtures build the
-  submission and echoed-job structs as literals, so a new output-affecting
-  submission field would have failed the build, and it did not.
+  0.11. The job-matching fixtures build the submission and echoed-job structs as
+  literals, so a new output-affecting submission field would have failed the build,
+  and it did not.
 - 0.60 narrows the vendor's job listing to a short form carrying only a job's id,
-  state and received-time. dbnget matches a request against every field of a job
-  and `dbnget list` shows them, so it keeps asking for the full listing - one
-  request, as before, rather than one per job on the account. The vendor will
-  retire the full form eventually; when it does the listing will fail outright
-  rather than come back thinner, so no run can mistake it for an empty account and
-  buy the same data twice.
+  state and received-time; the full details of a job are now a request per job.
+  dbnget matches on every field of a request and `dbnget list` shows them, so both
+  now fetch those details rather than relying on the deprecated whole-listing call,
+  which the vendor will remove.
+
+  The visible cost is that commands which have to look at the whole account got
+  slower, and on a long-lived account they got a lot slower - `dbnget list` on an
+  account of 472 jobs went from about a second to minutes. Details are fetched four
+  at a time to claw most of that back, and a vendor rate limit is waited out rather
+  than failing the command. Ordinary re-runs of a fetch are unaffected: those go
+  through the index and cost a request or two.
+- `dbnget get JOB_ID` asks about that one job rather than fetching the entire
+  account listing to find it.
 
 ## [0.2.0] - 2026-08-15
 

@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 use tracing::{debug, info, warn};
 
-use crate::{Outcome, cli::FetchArgs, jobs, query, spend, verify};
+use crate::{Outcome, cache::Cache, cli::FetchArgs, jobs, query, spend, verify};
 
 /// The stamp format for `--immediate` file names: sortable, and free of separators
 /// that would collide with the dotted fields around it.
@@ -44,16 +44,23 @@ struct Request {
     encoding: Encoding,
 }
 
-pub async fn run(client: &mut HistoricalClient, args: &FetchArgs) -> Result<Outcome> {
+pub async fn run(
+    client: &mut HistoricalClient,
+    cache: &Cache,
+    key: &str,
+    args: &FetchArgs,
+) -> Result<Outcome> {
     let request = validate(args)?;
 
     if args.cost {
         return cost(client, args, &request).await;
     }
     if args.immediate {
+        // The request index is a batch-job index, and streaming submits no job. There
+        // is nothing to record and nothing to propose, so this path never touches it.
         return immediate(client, args, &request).await;
     }
-    reconcile(client, args, &request).await
+    reconcile(client, cache, key, args, &request).await
 }
 
 fn validate(args: &FetchArgs) -> Result<Request> {
@@ -197,6 +204,8 @@ async fn resolve_summary(client: &mut HistoricalClient, request: &Request) -> Op
 /// The default path: reconcile the request against the vendor's job listing.
 async fn reconcile(
     client: &mut HistoricalClient,
+    cache: &Cache,
+    key: &str,
     args: &FetchArgs,
     request: &Request,
 ) -> Result<Outcome> {
@@ -207,46 +216,24 @@ async fn reconcile(
     warn_on_sub_microsecond(&request.range);
 
     let params = request.submit_params();
-    let listing = jobs::all(client).await?;
 
-    // The single most useful thing verbosity had to say was that adoption was attempted
-    // at all, and it was only visible as a vendor span buried in the client's own debug
-    // output. dbnget says it itself.
-    debug!(
-        jobs = listing.len(),
-        "checking whether a job already bought this request"
-    );
-
-    if let Some(job) = jobs::find_live(&listing, &params) {
-        return match job.state {
-            JobState::Done => {
-                // The zero-record rule is a property of the request, not of the path
-                // that reaches it. Checking it only before submitting would let an
-                // empty job already sitting on the account be adopted and exit 0,
-                // which is the same "symbology or date-range mistake delivered as an
-                // empty file" the spend gate exists to refuse. Refusing rather than
-                // ignoring the job matters: ignoring it would fall through and submit
-                // a duplicate.
-                if job.record_count == Some(0) {
-                    bail!(
-                        "job {} matches this request but holds no records - check the symbols, dataset and date range",
-                        job.id
-                    );
-                }
-                info!(job_id = %job.id, "adopting finished job");
-                jobs::download(client, &job.id, &args.output).await
-            }
-            _ => {
-                report_pending(&job);
-                Ok(Outcome::Nonterminal)
-            }
-        };
-    }
+    // Reconciliation is the whole safety story: it either hands back a job the vendor
+    // confirmed live, or a proof that a complete live sweep of the account found
+    // nothing. Only the second authorises the submit below.
+    let no_match = match jobs::reconcile(client, cache, key, &params).await? {
+        jobs::Reconciled::Match(job) => return adopt(client, &job, &args.output).await,
+        jobs::Reconciled::None(proof) => proof,
+    };
 
     // A matching expired job means the account already paid for this exact data once,
     // and the prepared files are gone. Submitting again is a re-purchase at full
     // price, which must be said out loud rather than surfacing as a generic refusal.
-    if let Some(expired) = jobs::find_expired(&listing, &params) {
+    //
+    // This comes off the exhaustive sweep rather than a separate lookup, because the
+    // ABSENCE of this warning is information too - it tells the user this is a first
+    // purchase. A hint that quietly failed to propose the expired job would turn a
+    // re-purchase into a silent one.
+    if let Some(expired) = no_match.expired() {
         warn!(
             job_id = %expired.id,
             expired_on = %expired
@@ -265,9 +252,44 @@ async fn reconcile(
         .submit_job(&params)
         .await
         .context("submitting batch job")?;
+    // Indexing the job dbnget just created is what makes the first poll cheap, and the
+    // value stored is the vendor's own echo rather than what was sent. `put` cannot
+    // fail loudly: this submission may already have charged, so an error here would
+    // read as a failed submit, which is the one impression that must never be given.
+    cache.put(&job);
     jobs::print_job(&job);
     println!("queued; re-run the same command to poll and, once done, download");
     Ok(Outcome::Nonterminal)
+}
+
+/// Takes delivery of a job the vendor confirmed, live, delivers this exact request.
+async fn adopt(client: &mut HistoricalClient, job: &BatchJob, out: &Path) -> Result<Outcome> {
+    match job.state {
+        JobState::Done => {
+            // The zero-record rule is a property of the request, not of the path that
+            // reaches it. Checking it only before submitting would let an empty job
+            // already sitting on the account be adopted and exit 0, which is the same
+            // "symbology or date-range mistake delivered as an empty file" the spend
+            // gate exists to refuse. Refusing rather than ignoring the job matters:
+            // ignoring it would fall through and submit a duplicate.
+            //
+            // The count read here comes from the confirming detail response, never from
+            // the index, which stores no counts precisely so that this cannot be
+            // decided on a remembered value.
+            if job.record_count == Some(0) {
+                bail!(
+                    "job {} matches this request but holds no records - check the symbols, dataset and date range",
+                    job.id
+                );
+            }
+            info!(job_id = %job.id, "adopting finished job");
+            jobs::download(client, &job.id, out).await
+        }
+        _ => {
+            report_pending(job);
+            Ok(Outcome::Nonterminal)
+        }
+    }
 }
 
 /// One line about a job that is still preparing: state, how long it has been in that

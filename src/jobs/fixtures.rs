@@ -19,7 +19,7 @@ use super::effective_map_symbols;
 
 /// A submission with every field at the default the fetch path builds, mutated by
 /// the caller.
-pub(super) fn params(edit: impl FnOnce(&mut SubmitJobParams)) -> SubmitJobParams {
+pub(crate) fn params(edit: impl FnOnce(&mut SubmitJobParams)) -> SubmitJobParams {
     let mut params = SubmitJobParams {
         dataset: "GLBX.MDP3".to_owned(),
         symbols: Symbols::Symbols(vec!["ESM4".to_owned()]),
@@ -46,7 +46,7 @@ pub(super) fn params(edit: impl FnOnce(&mut SubmitJobParams)) -> SubmitJobParams
 
 /// The job the vendor would echo back for `params`, with its defaults resolved the
 /// way the vendor resolves them.
-pub(super) fn job_from(params: &SubmitJobParams) -> BatchJob {
+pub(crate) fn job_from(params: &SubmitJobParams) -> BatchJob {
     BatchJob {
         id: "GLBX-20260813-TESTJOB".to_owned(),
         user_id: None,

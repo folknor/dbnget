@@ -1,3 +1,4 @@
+mod cache;
 mod cli;
 mod dataset;
 mod fetch;
@@ -61,10 +62,16 @@ async fn run() -> Result<Outcome> {
         return Ok(Outcome::Settled);
     }
 
-    let mut client = build_client(args.key.as_deref())?;
+    let key = resolve_required_key(args.key.as_deref())?;
+    let mut client = build_client(&key)?;
+    // Partitioned by credential so two accounts cannot see each other's hints. Opening
+    // never fails: a cache that cannot be made private is simply disabled, because
+    // nothing the program decides depends on it.
+    let cache = cache::Cache::open(&key);
+
     match &args.command {
         Some(Command::List(list_args)) => match list_args.what {
-            cli::ListWhat::Jobs => jobs::list(&mut client, list_args).await,
+            cli::ListWhat::Jobs => jobs::list(&mut client, &cache, &key, list_args).await,
             cli::ListWhat::Datasets => {
                 if !list_args.state.is_empty() || list_args.since.is_some() {
                     bail!("--state and --since filter jobs, not datasets");
@@ -76,7 +83,7 @@ async fn run() -> Result<Outcome> {
         Some(Command::Get(get_args)) => {
             jobs::download(&mut client, &get_args.job_id, &get_args.output).await
         }
-        None => fetch::run(&mut client, &args.fetch).await,
+        None => fetch::run(&mut client, &cache, &key, &args.fetch).await,
     }
 }
 
@@ -103,11 +110,23 @@ fn init_tracing(verbosity: u8) {
         .init();
 }
 
-fn build_client(key: Option<&str>) -> Result<HistoricalClient> {
-    let key = key
-        .map(resolve_key)
+/// The API key, resolved from the flag or the environment.
+///
+/// Split out from [`build_client`] because the key is also what partitions the request
+/// index: two credentials must not share hints. It is returned rather than kept inside
+/// the client so exactly one caller sees it, and it is never written to a path, a file,
+/// or a log.
+fn resolve_required_key(key: Option<&str>) -> Result<String> {
+    key.map(resolve_key)
         .transpose()?
-        .context("no API key: pass --key or set DATABENTO_API_KEY")?;
+        .context("no API key: pass --key or set DATABENTO_API_KEY")
+}
+
+/// Builds a client for `key`.
+///
+/// Called more than once per run on purpose. A detail fan-out gives each worker its own
+/// client, because a request needs `&mut HistoricalClient` and the type is not `Clone`.
+pub fn build_client(key: &str) -> Result<HistoricalClient> {
     HistoricalClient::builder()
         .key(key)
         .context("the API key was not accepted")?

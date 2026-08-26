@@ -370,6 +370,37 @@ in progress elsewhere. The lock is advisory and released by the operating system
 the process ends, crash or kill included, so there is never a stale lock to clear by
 hand; the `.dbnget-lock` file itself is inert and re-used.
 
+## The request index
+
+Every run has to work out whether a job on the account already bought what you are
+asking for. The vendor's listing gives ids and states cheaply, but what each job was
+actually asked for costs one request per job, so an account with hundreds of jobs would
+mean hundreds of requests on every single run.
+
+dbnget keeps an index to avoid that, in your platform cache directory -
+`~/.cache/dbnget` on Linux, honouring `XDG_CACHE_HOME`. It records which request each
+job id belongs to, so a re-run can go straight to the job that already has your data.
+
+It is a hint and never an authority:
+
+- A job is only adopted after the vendor confirms, live, that it delivers your request.
+- Nothing is ever submitted until a complete live sweep of your account has found no
+  match.
+
+So an index that is stale, corrupt, deleted, or tampered with cannot make dbnget buy
+data twice or hand you the wrong job. The worst it can do is cost a few extra requests.
+If the directory cannot be created or made private, the index is disabled and every
+command behaves exactly as it would without it.
+
+It holds no API key, no prices and no file sizes - only which request belongs to which
+job id - and it is written so that only you can read it. Delete it whenever you like;
+it rebuilds itself. `dbnget list` refreshes it as a side effect, since it reads every
+job anyway.
+
+Commands that must look at your whole account - `dbnget list`, and a fetch that is about
+to buy something - are slower than they used to be, noticeably so on an account with a
+long history. Ordinary re-runs of a fetch are not: those go through the index.
+
 ## Verbosity
 
 `-v` is dbnget at debug, which is where the reconcile steps are: how many jobs were

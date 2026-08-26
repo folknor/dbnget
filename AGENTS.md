@@ -11,13 +11,20 @@ and what must not be broken.
 
 ## Architecture: the command IS the state machine
 
-There is no local ledger, no state file, and no daemon. Each run reconciles the
-request against the vendor's own batch-job listing, because that listing is the only
-account of what was actually bought. Re-running the same command is the poll loop:
+There is no local ledger and no daemon. Each run reconciles the request against the
+vendor's own batch-job listing, because that listing is the only account of what was
+actually bought. Re-running the same command is the poll loop:
 
 - No matching job: submit one, subject to the spend gate, exit 3.
 - A matching job still preparing: report state and progress, exit 3.
 - A matching job done: download into `OUT/JOB_ID/`, verify every file, exit 0.
+
+There IS a file on disk now - the request index below - and the distinction it turns on
+is the one that matters: a ledger is authoritative about what was bought and is
+dangerous when stale or missing, while the index is consulted only for ids the live
+listing just returned and costs a wasted request when wrong. Nothing read from it
+decides whether money is spent. If that ever stops being true, it has become a ledger
+and this section is a lie.
 
 Matching is on the request itself - dataset, schema, symbols as a case-insensitive
 deduplicated set, bounds, symbology, and EVERY output-affecting submission field
@@ -43,15 +50,64 @@ a JSON array, and the client maps only a SCALAR `"ALL_SYMBOLS"` string to
 Comparing the enum variants directly never matched, and the request it failed to match
 is the most expensive one an account can make. Both forms canonicalize to the sentinel.
 
-The job listing must be the FULL one. Since databento 0.60, `list_jobs` returns a short
-form of id, state and received-time only, and `list_jobs_full` - deprecated, one request
-for everything - is what dbnget calls. The short form cannot support this tool at all:
-the match key reads every output-affecting field and `dbnget list` is required to show
-them, so the alternative is `get_job_details` once per job on the account on EVERY run.
-When the vendor retires the full form, `BatchJob` will fail to deserialize and the
-listing will error out, taking every command with it. That is the correct direction to
-fail - a listing that errors cannot be read as "no matching job", so the change cannot
-double-charge anyone - and it is the signal to write the fan-out, not before.
+The listing is TWO calls now, and the split is the whole architecture. Since databento
+0.60 `list_jobs` returns a short form - id, state, received-time - and nothing else, so
+it defines WHICH jobs exist and never whether one delivers a request. Request identity
+costs `get_job_details`, once per job. Note that STATE is then taken from the detail
+response rather than the short row that named the job: the detail fetch happens after
+the listing, so it is the fresher of two live answers, and every part of the program
+reads state from the same place. The short listing is authoritative for MEMBERSHIP,
+which is what the sweep needs it for. dbnget therefore keeps an untrusted request index
+in the XDG cache dir (`cache.rs`), and the rules that make a persistent store admissible
+at all are these:
+
+- **Adoption requires live confirmation.** The index proposes candidates; each is
+  fetched and re-matched against the live response before anything is downloaded. A
+  wrong entry costs one wasted request.
+- **Submission requires live exhaustion.** `Reconciled::None` carries `NoLiveMatch`,
+  which has no public constructor and is only produced after fetching details for EVERY
+  job in the live listing. A missing or poisoned entry cannot cause a duplicate
+  purchase - the worst it does is fail to save requests.
+
+That second rule is why the no-match answer is a type and not an `Option<BatchJob>`. A
+`None` reads identically whether the index proposed nothing, a confirmation failed, or
+the account was swept clean, and only the last may authorise a charge. A failed
+confirmation falls THROUGH to the sweep; a transport error propagates. "The vendor did
+not answer" and "the vendor says there is nothing" must never be the same value.
+
+The index stores identity only - the match key, plus `id` and `ts_received` to join
+against the live listing. No state, no record count, no sizes, costs or processing
+timestamps: those move, the live listing already supplies state, and the confirming
+response supplies the rest. Storing identity only is also why entries are written for
+jobs in EVERY state, including queued ones: a job's REQUEST is fixed when the vendor
+accepts it, so the poll loop proposes a candidate on the first re-run instead of
+sweeping. Entries are written from the vendor's ECHO, never from `SubmitJobParams`, so
+they carry the vendor's normalization; `RequestKey::from_submit_params` exists only to
+build a lookup and has to resolve the encoding-dependent `map_symbols` default to reach
+the same shape. If those two constructors drift, lookups miss, every run sweeps, and
+nothing fails - it just gets slow, which is the correct direction for that type to fail.
+
+The sweep covers EVERY state, not just the adoptable ones, because the expired
+re-purchase warning rides on it and the ABSENCE of that warning is information: it tells
+the user this is a first purchase. `dbnget list` renders live details only and never
+reads the index, because it is the surface people use to work out why a request did not
+adopt something, and a stale field there sends them hunting a matcher bug that does not
+exist. It does WRITE what it fetched, which warms the index for free.
+
+Cache failure is always a performance event and never a reconciliation result. A missing
+directory, a hostile mode, a corrupt entry, an unwritable disk: all of them disable the
+store for the run and leave the live algorithm untouched. None of them may become "no
+matching job", because that sentence is what authorises a charge.
+
+The vendor throttles the detail endpoint - eight concurrent workers drew `429 Too Many
+Requests` within seconds against a real account - so the fan-out runs four at a time and
+waits a 429 out with bounded backoff. A throttled request is not a statement about a
+job. Every other status fails immediately, and a partial listing must never reach the
+matcher: a job missing from a sweep looks exactly like a job that does not match.
+
+`list_jobs_full` still exists and is deprecated. Do not go back to it. It is one request
+instead of hundreds, which is exactly why it is tempting, and it disappears the day the
+endpoint stops serving full details.
 
 The job listing is fetched with an EXPLICIT state filter, never an omitted one. An
 omitted filter means "all except expired" server-side, which made the expired
@@ -278,8 +334,11 @@ Detail lives in the code; this is the map.
   instants, the half-open range (a bare `--start` covers exactly that UTC day),
   symbols, states, formats.
 - `fetch.rs` - the fetch verb and the reconcile-submit-poll-download state machine.
-- `jobs.rs` - the batch-job listing, job matching, `dbnget list`, and the verified
-  download.
+- `jobs.rs` - the batch-job listing, the reconcile-confirm-sweep machinery, job
+  matching, `dbnget list`, and the verified download.
+- `cache.rs` - the untrusted request index under the XDG cache dir: what it may
+  propose, what it may never decide, and why failure disables it rather than failing
+  a command.
 - `lock.rs` - the exclusive claim on an output directory, held for a download.
 - `dataset.rs` - `dbnget list datasets` and `dbnget dataset` (range, schemas, unit
   prices, `--publishers`, filtered to the one dataset).

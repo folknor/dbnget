@@ -8,16 +8,22 @@ use databento::{
     HistoricalClient, Symbols,
     dbn::{Compression, Encoding},
     historical::batch::{
-        BatchJob, DownloadParams, JobState, ListJobsParams, SplitDuration, SubmitJobParams,
+        BatchJob, BatchJobShort, DownloadParams, JobState, ListJobsParams, SplitDuration,
+        SubmitJobParams,
     },
 };
 use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
-use crate::{Outcome, cli::ListArgs, lock, query, verify};
+use crate::{
+    Outcome,
+    cache::{Cache, RequestKey},
+    cli::ListArgs,
+    lock, query, verify,
+};
 
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 mod render;
 
 use render::print_header;
@@ -25,7 +31,12 @@ pub use render::print_job;
 
 /// `dbnget list` - the vendor's job listing is the only account of what was bought,
 /// and this is the user's tool for checking it before submitting.
-pub async fn list(client: &mut HistoricalClient, args: &ListArgs) -> Result<Outcome> {
+pub async fn list(
+    client: &mut HistoricalClient,
+    cache: &Cache,
+    key: &str,
+    args: &ListArgs,
+) -> Result<Outcome> {
     let states = if args.state.is_empty() {
         // Naming every state, rather than omitting the filter, for the reasons on
         // `LISTED_STATES`: an omitted filter hides expired jobs and admits states this
@@ -44,9 +55,20 @@ pub async fn list(client: &mut HistoricalClient, args: &ListArgs) -> Result<Outc
         .maybe_since(since)
         .build();
 
-    let jobs = full_listing(client, &params)
+    // Live details for every job, never a cached value. `list` is the surface people
+    // use to work out WHY a request did not adopt an existing job, so a stale field
+    // here sends someone hunting a matcher bug that does not exist. A hint is not
+    // allowed to answer a diagnostic question.
+    let jobs = listed_details(client, key, &params)
         .await
         .context("listing batch jobs")?;
+    // Every row here was just fetched live, which is exactly what an index entry is
+    // made of, so recording them costs nothing and warms the store for the next fetch.
+    // It stays a one-way street: `list` writes to the index and never reads from it.
+    for job in &jobs {
+        cache.put(job);
+    }
+
     if jobs.is_empty() {
         println!("no jobs");
     } else {
@@ -79,42 +101,307 @@ const LISTED_STATES: [JobState; 4] = [
     JobState::Expired,
 ];
 
-/// Fetches every job on the account, in every state this client understands. Expired
-/// jobs are included so the caller can warn that a re-submit is a re-purchase.
-pub async fn all(client: &mut HistoricalClient) -> Result<Vec<BatchJob>> {
-    let params = ListJobsParams::builder()
-        .states(LISTED_STATES.to_vec())
-        .build();
-    full_listing(client, &params)
+/// The account's jobs as the vendor's short listing gives them: id, state and
+/// received-time, and nothing else.
+///
+/// This is the authoritative statement of WHICH jobs exist, and it is the membership
+/// the sweep has to be exhaustive over. It carries no request identity beyond the id, so
+/// it can never answer whether a job delivers a request - that always takes a detail
+/// fetch.
+///
+/// Its `state` is not what the program reads. State comes from the detail response,
+/// which is fetched afterwards and is therefore the fresher of two live answers, and
+/// every decision in the program reads it from that one place rather than mixing the
+/// two sources.
+async fn short_listing(
+    client: &mut HistoricalClient,
+    params: &ListJobsParams,
+) -> Result<Vec<BatchJobShort>> {
+    client
+        .batch()
+        .list_jobs(params)
         .await
         .context("listing existing jobs")
 }
 
-/// The job listing with every field on it, which is the only listing this tool can use.
+/// Every state this client understands, as the parameters that ask for them.
+fn every_state() -> ListJobsParams {
+    ListJobsParams::builder()
+        .states(LISTED_STATES.to_vec())
+        .build()
+}
+
+/// The full record for one job, which is the only authoritative source of its request.
 ///
-/// `list_jobs` was narrowed in databento 0.60 to a short form carrying id, state and
-/// received-time and nothing else. dbnget cannot match a request against that: the match
-/// key reads dataset, schema, symbols, bounds, symbology and every output-shaping field,
-/// and `dbnget list` exists to show them. So this calls the deprecated full variant,
-/// which is one request rather than one per job.
+/// Retries a rate limit rather than failing on one. The vendor throttles this endpoint -
+/// measured at eight concurrent workers against a real account, it answers `429 Too Many
+/// Requests: Retry in 1s` - and a throttled request is not a statement about the job.
+/// Everything else fails immediately: a sweep that gave up quietly would look like a
+/// sweep that found nothing, and that is the difference between adopting a job and
+/// buying its data twice.
+async fn details(client: &mut HistoricalClient, id: &str) -> Result<BatchJob> {
+    let mut delay = RATE_LIMIT_BACKOFF;
+    let mut attempts = 0;
+    loop {
+        match client.batch().get_job_details(id).await {
+            Ok(job) if job.id != id => {
+                // The whole fan-out assumes a detail response describes the job it was
+                // asked about: results are reassembled positionally, and a mismatched
+                // record would be matched against the wrong request. Cheap to check and
+                // it should never fire.
+                bail!(
+                    "asked the vendor for job {id} and it answered about {}",
+                    job.id
+                );
+            }
+            Ok(job) => return Ok(job),
+            Err(err) if is_rate_limited(&err) && attempts < RATE_LIMIT_RETRIES => {
+                attempts += 1;
+                // Jittered so the workers do not retry in lockstep. Without it a
+                // throttle that hits all four at once has them collide again on every
+                // subsequent attempt, converting the backoff into a synchronised stall.
+                let jitter = jitter_for(id, attempts);
+                debug!(
+                    job_id = id,
+                    attempt = attempts,
+                    backoff_ms = (delay + jitter).as_millis(),
+                    "rate limited; backing off"
+                );
+                tokio::time::sleep(delay + jitter).await;
+                delay = delay.saturating_mul(2);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("fetching details for job {id}"));
+            }
+        }
+    }
+}
+
+/// How many times a single detail request will wait out a rate limit before giving up.
 ///
-/// The vendor says the endpoint will stop returning full details at some future date.
-/// When it does, this fails loudly - `BatchJob` cannot deserialize without those fields,
-/// so the listing errors and every command with it. That is the safe direction to fail:
-/// no run can conclude "no matching job" from a listing it never got, so nothing can be
-/// double-charged by the change. The fix at that point is a per-job `get_job_details`
-/// fan-out, which costs one request per job on the account on every single run - a real
-/// enough price that it is not worth paying before the endpoint forces it.
-async fn full_listing(
+/// Six doublings from a second is just over a minute of patience per job, which is far
+/// longer than a throttle lasts and still bounded - an unbounded retry would turn a
+/// server-side problem into a command that never returns.
+const RATE_LIMIT_RETRIES: u32 = 6;
+const RATE_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the vendor refused this request for pacing reasons rather than substantive
+/// ones. Only 429 counts: every other status says something about the request itself,
+/// and retrying one of those would be guessing rather than waiting.
+fn is_rate_limited(err: &databento::Error) -> bool {
+    matches!(err, databento::Error::Api(api) if api.status_code.as_u16() == 429)
+}
+
+/// Up to a second of spread, derived from the job id so concurrent workers pick
+/// different offsets without a random number generator.
+fn jitter_for(id: &str, attempt: u32) -> std::time::Duration {
+    let mixed = id.bytes().fold(u64::from(attempt), |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(u64::from(b))
+    });
+    std::time::Duration::from_millis(mixed % 1_000)
+}
+
+/// How many detail requests are in flight at once during a fan-out.
+///
+/// The short listing costs one request and the details cost one PER JOB, so an account
+/// with a long history turns every exhaustive pass into hundreds of round trips. Serial,
+/// that is minutes: measured against a real account of 474 jobs, `dbnget list` went from
+/// about a second on the old whole-listing endpoint to roughly three minutes.
+///
+/// Four rather than more because the vendor throttles: eight workers against a real
+/// account drew `429 Too Many Requests` within seconds. [`details`] waits a rate limit
+/// out, so a high number here does not fail - it just converts parallelism into backoff
+/// and stops buying anything.
+const FANOUT: usize = 4;
+
+/// Fetches details for many jobs at once, preserving the order of `ids`.
+///
+/// Each worker owns its own client because `HistoricalClient` needs `&mut self` for a
+/// request and is not `Clone`. Rebuilding one is cheap - a key, a URL and a `reqwest`
+/// client - and the alternative, serializing every request behind one borrow, is the
+/// cost this function exists to remove.
+///
+/// Any error from any worker fails the whole call. That is not a detail: a partial
+/// listing must never reach the matcher, because a job missing from a sweep looks
+/// exactly like a job that does not match, and that is the difference between adopting
+/// and buying the data a second time.
+async fn details_many(key: &str, ids: &[String]) -> Result<Vec<BatchJob>> {
+    if ids.len() <= 1 {
+        // Not worth a task or a second client, and this is the common shape once the
+        // request index is warm.
+        let mut client = crate::build_client(key)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(details(&mut client, id).await?);
+        }
+        return Ok(out);
+    }
+
+    let chunk_size = ids.len().div_ceil(FANOUT).max(1);
+    let mut workers = tokio::task::JoinSet::new();
+    for (index, chunk) in ids.chunks(chunk_size).enumerate() {
+        let key = key.to_owned();
+        let chunk: Vec<String> = chunk.to_vec();
+        workers.spawn(async move {
+            let mut client = crate::build_client(&key)?;
+            let mut out = Vec::with_capacity(chunk.len());
+            for id in &chunk {
+                out.push(details(&mut client, id).await?);
+            }
+            Ok::<_, anyhow::Error>((index, out))
+        });
+    }
+
+    // Reassembled by chunk index so the result matches the vendor's ordering, which is
+    // what `dbnget list` prints and what makes its output stable between runs.
+    let mut chunks: Vec<(usize, Vec<BatchJob>)> = Vec::with_capacity(FANOUT);
+    while let Some(joined) = workers.join_next().await {
+        chunks.push(joined.context("a job detail worker did not finish")??);
+    }
+    chunks.sort_by_key(|(index, _)| *index);
+    Ok(chunks.into_iter().flat_map(|(_, jobs)| jobs).collect())
+}
+
+/// Every job the filter selects, with its full details, one request per job.
+///
+/// The expensive, exhaustive path. It exists because two things have to be true of the
+/// whole account rather than of one job: that NO job matches a request about to be paid
+/// for, and that `dbnget list` shows current values rather than remembered ones.
+async fn listed_details(
     client: &mut HistoricalClient,
+    key: &str,
     params: &ListJobsParams,
 ) -> Result<Vec<BatchJob>> {
-    #[expect(
-        deprecated,
-        reason = "the short form omits every field matching and listing read; see above"
-    )]
-    let jobs = client.batch().list_jobs_full(params).await?;
-    Ok(jobs)
+    let short = short_listing(client, params).await?;
+    let ids: Vec<String> = short.into_iter().map(|entry| entry.id).collect();
+    details_many(key, &ids).await
+}
+
+/// Proof that a COMPLETE live sweep of the account found nothing matching the request.
+///
+/// This type is the safety rule made structural. Submitting is the only chargeable
+/// action in the program, and it may happen only when no existing job would deliver the
+/// same data - so the "no match" answer has to be distinguishable from every other way
+/// a lookup can come back empty. An `Option<BatchJob>` cannot do that: its `None` reads
+/// identically whether the index proposed nothing, a confirmation failed, or the whole
+/// account was swept and came back clean. Only the last authorises a charge.
+///
+/// So there is no public constructor. The only way to obtain one is [`reconcile`],
+/// which builds it after fetching live details for every job in the live listing.
+#[derive(Debug)]
+pub struct NoLiveMatch {
+    /// A live-confirmed expired job for this exact request, if the account has one.
+    ///
+    /// Carried on the proof rather than looked up separately because the sweep that
+    /// establishes "nothing live matches" is the same sweep that can see this. The
+    /// warning it drives is not chargeable, but its ABSENCE is meaningful - it tells
+    /// the user this is a first purchase - so it has to come from the exhaustive live
+    /// pass and never from a hint.
+    ///
+    /// PRIVATE, and that is the whole point of the type. A public field would let any
+    /// module write `NoLiveMatch { expired: None }` and hand it to the submit path,
+    /// which is exactly the bypass this type exists to make unrepresentable.
+    expired: Option<Box<BatchJob>>,
+}
+
+impl NoLiveMatch {
+    /// The expired job that already bought this request, if there is one.
+    pub fn expired(&self) -> Option<&BatchJob> {
+        self.expired.as_deref()
+    }
+}
+
+/// The outcome of reconciling a request against the account.
+#[derive(Debug)]
+pub enum Reconciled {
+    /// A live-confirmed job that delivers exactly this request.
+    Match(Box<BatchJob>),
+    /// Nothing on the account delivers it, established exhaustively against live data.
+    None(NoLiveMatch),
+}
+
+/// Finds the job that already bought `params`, or proves that none did.
+///
+/// # The safety argument
+///
+/// Two rules, and everything else here is optimization:
+///
+/// 1. **Adoption requires live confirmation.** The index proposes candidates; each one
+///    is fetched and re-matched against the live response before it can be returned. A
+///    wrong or poisoned entry costs one wasted request and cannot cause a wrong
+///    download.
+/// 2. **Submission requires live exhaustion.** [`Reconciled::None`] is only ever
+///    produced after fetching details for every job in the live listing. A missing or
+///    wrong entry therefore cannot cause a duplicate purchase - the worst it can do is
+///    fail to save requests.
+///
+/// A failed confirmation falls through to the sweep rather than being read as a
+/// non-match, and any transport error propagates rather than becoming one. "The vendor
+/// did not answer" and "the vendor says there is nothing" must never be the same value.
+pub async fn reconcile(
+    client: &mut HistoricalClient,
+    cache: &Cache,
+    key: &str,
+    params: &SubmitJobParams,
+) -> Result<Reconciled> {
+    let short = short_listing(client, &every_state()).await?;
+    debug!(
+        jobs = short.len(),
+        "checking whether a job already bought this request"
+    );
+
+    let wanted = RequestKey::from_submit_params(params);
+
+    // The fast path. Ask the index which jobs are worth opening, and confirm each
+    // against live data. On the poll loop - the same command re-run until a job is
+    // ready - this is one detail request instead of one per job on the account.
+    for entry in &short {
+        if cache.get(&entry.id, entry.ts_received).as_ref() != Some(&wanted) {
+            continue;
+        }
+        let job = details(client, &entry.id).await?;
+        cache.put(&job);
+        if job_matches(&job, params) && job.state != JobState::Expired {
+            debug!(job_id = %job.id, "index proposed a candidate and the vendor confirmed it");
+            return Ok(Reconciled::Match(Box::new(job)));
+        }
+        // The hint was stale or wrong. That is not evidence about the rest of the
+        // account, so the sweep still has to happen.
+        debug!(job_id = %job.id, "index proposed a candidate the vendor did not confirm");
+    }
+
+    // The slow path. Nothing was proposed, or nothing proposed survived confirmation.
+    // Everything below this line is live.
+    sweep(cache, key, &short, params).await
+}
+
+/// Fetches every job in `short` and decides against live data alone.
+///
+/// Covers EVERY state rather than stopping at the adoptable ones. The expired
+/// re-purchase warning is why: a run that submits without having looked at the expired
+/// jobs would report a re-purchase as a first purchase, and silence from that warning
+/// is something users read as meaningful.
+async fn sweep(
+    cache: &Cache,
+    key: &str,
+    short: &[BatchJobShort],
+    params: &SubmitJobParams,
+) -> Result<Reconciled> {
+    debug!(jobs = short.len(), "sweeping every job on the account");
+    let ids: Vec<String> = short.iter().map(|entry| entry.id.clone()).collect();
+    let jobs = details_many(key, &ids).await?;
+    for job in &jobs {
+        // Populating from the sweep is what makes the next run cheap. The value written
+        // is the vendor's own echo, which is the shape matching compares against.
+        cache.put(job);
+    }
+
+    if let Some(job) = find_live(&jobs, params) {
+        return Ok(Reconciled::Match(Box::new(job)));
+    }
+    Ok(Reconciled::None(NoLiveMatch {
+        expired: find_expired(&jobs, params).map(Box::new),
+    }))
 }
 
 /// Picks the best live job that would deliver exactly what `params` asks for.
@@ -187,7 +474,7 @@ fn job_matches(job: &BatchJob, params: &SubmitJobParams) -> bool {
 /// The submission carries an `Option<bool>` and the job echoes back a concrete `bool`,
 /// so comparing them directly would never match on the default path. The default is
 /// encoding-dependent: text encodings get the symbol column, DBN does not.
-fn effective_map_symbols(params: &SubmitJobParams) -> bool {
+pub fn effective_map_symbols(params: &SubmitJobParams) -> bool {
     params
         .map_symbols
         .unwrap_or_else(|| text_encoding_default(params.encoding))
@@ -275,11 +562,12 @@ pub fn canonical_symbols(symbols: &Symbols) -> Vec<String> {
 /// whether to download. A listing that fails must not turn a working `dbnget get` into
 /// an error, so an unanswerable question leaves the caller's original diagnosis intact.
 async fn state_of(client: &mut HistoricalClient, job_id: &str) -> Option<JobState> {
-    match all(client).await {
-        Ok(jobs) => jobs
-            .into_iter()
-            .find(|job| job.id == job_id)
-            .map(|job| job.state),
+    // One request for one job. This used to pull the entire listing and search it,
+    // which was reasonable when the listing arrived whole in a single call; against a
+    // per-job fan-out it would have meant fetching every job on the account to read one
+    // field off one of them.
+    match details(client, job_id).await {
+        Ok(job) => Some(job.state),
         Err(err) => {
             debug!(%err, "could not check the job's state");
             None
