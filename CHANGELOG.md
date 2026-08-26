@@ -9,10 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The vendor client moves to `databento` 0.59 (DBN 0.67) and hashing to `sha2`
+- The vendor client moves to `databento` 0.60 (DBN 0.68) and hashing to `sha2`
   0.11. No dbnget behavior changes: the job-matching fixtures build the
   submission and echoed-job structs as literals, so a new output-affecting
   submission field would have failed the build, and it did not.
+- 0.60 narrows the vendor's job listing to a short form carrying only a job's id,
+  state and received-time. dbnget matches a request against every field of a job
+  and `dbnget list` shows them, so it keeps asking for the full listing - one
+  request, as before, rather than one per job on the account. The vendor will
+  retire the full form eventually; when it does the listing will fail outright
+  rather than come back thinner, so no run can mistake it for an empty account and
+  buy the same data twice.
 
 ## [0.2.0] - 2026-08-15
 

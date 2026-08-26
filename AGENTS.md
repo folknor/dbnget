@@ -43,6 +43,16 @@ a JSON array, and the client maps only a SCALAR `"ALL_SYMBOLS"` string to
 Comparing the enum variants directly never matched, and the request it failed to match
 is the most expensive one an account can make. Both forms canonicalize to the sentinel.
 
+The job listing must be the FULL one. Since databento 0.60, `list_jobs` returns a short
+form of id, state and received-time only, and `list_jobs_full` - deprecated, one request
+for everything - is what dbnget calls. The short form cannot support this tool at all:
+the match key reads every output-affecting field and `dbnget list` is required to show
+them, so the alternative is `get_job_details` once per job on the account on EVERY run.
+When the vendor retires the full form, `BatchJob` will fail to deserialize and the
+listing will error out, taking every command with it. That is the correct direction to
+fail - a listing that errors cannot be read as "no matching job", so the change cannot
+double-charge anyone - and it is the signal to write the fan-out, not before.
+
 The job listing is fetched with an EXPLICIT state filter, never an omitted one. An
 omitted filter means "all except expired" server-side, which made the expired
 re-purchase warning unreachable, and it admits states this client's `JobState` cannot

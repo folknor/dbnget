@@ -44,9 +44,7 @@ pub async fn list(client: &mut HistoricalClient, args: &ListArgs) -> Result<Outc
         .maybe_since(since)
         .build();
 
-    let jobs = client
-        .batch()
-        .list_jobs(&params)
+    let jobs = full_listing(client, &params)
         .await
         .context("listing batch jobs")?;
     if jobs.is_empty() {
@@ -87,11 +85,36 @@ pub async fn all(client: &mut HistoricalClient) -> Result<Vec<BatchJob>> {
     let params = ListJobsParams::builder()
         .states(LISTED_STATES.to_vec())
         .build();
-    client
-        .batch()
-        .list_jobs(&params)
+    full_listing(client, &params)
         .await
         .context("listing existing jobs")
+}
+
+/// The job listing with every field on it, which is the only listing this tool can use.
+///
+/// `list_jobs` was narrowed in databento 0.60 to a short form carrying id, state and
+/// received-time and nothing else. dbnget cannot match a request against that: the match
+/// key reads dataset, schema, symbols, bounds, symbology and every output-shaping field,
+/// and `dbnget list` exists to show them. So this calls the deprecated full variant,
+/// which is one request rather than one per job.
+///
+/// The vendor says the endpoint will stop returning full details at some future date.
+/// When it does, this fails loudly - `BatchJob` cannot deserialize without those fields,
+/// so the listing errors and every command with it. That is the safe direction to fail:
+/// no run can conclude "no matching job" from a listing it never got, so nothing can be
+/// double-charged by the change. The fix at that point is a per-job `get_job_details`
+/// fan-out, which costs one request per job on the account on every single run - a real
+/// enough price that it is not worth paying before the endpoint forces it.
+async fn full_listing(
+    client: &mut HistoricalClient,
+    params: &ListJobsParams,
+) -> Result<Vec<BatchJob>> {
+    #[expect(
+        deprecated,
+        reason = "the short form omits every field matching and listing read; see above"
+    )]
+    let jobs = client.batch().list_jobs_full(params).await?;
+    Ok(jobs)
 }
 
 /// Picks the best live job that would deliver exactly what `params` asks for.

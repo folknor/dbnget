@@ -30,7 +30,7 @@ exclude = [
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
-databento = "0.59"
+databento = "0.60.0"
 # Cross-platform advisory file locking. The lock has to be released by the operating
 # system when the process dies, because a download is exactly the thing that gets
 # interrupted - anything we would have to clean up ourselves goes stale on the one path
