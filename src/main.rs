@@ -4,11 +4,12 @@ mod dataset;
 mod fetch;
 mod jobs;
 mod lock;
+mod progress;
 mod query;
 mod spend;
 mod verify;
 
-use std::process::ExitCode;
+use std::{io::IsTerminal, process::ExitCode};
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
@@ -107,6 +108,10 @@ fn init_tracing(verbosity: u8) {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        // Colour only for a terminal. The default is unconditional, so redirecting the
+        // log to a file wrote escape sequences into it, which is noise in the one place
+        // the log exists to be read later.
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 }
 

@@ -38,10 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The visible cost is that commands which have to look at the whole account got
   slower, and on a long-lived account they got a lot slower - `dbnget list` on an
-  account of 472 jobs went from about a second to minutes. Details are fetched four
-  at a time to claw most of that back, and a vendor rate limit is waited out rather
-  than failing the command. Ordinary re-runs of a fetch are unaffected: those go
-  through the index and cost a request or two.
+  account of 472 jobs went from about a second to three minutes. Details are fetched
+  four at a time, which brings that back to about eighty seconds, and a vendor rate
+  limit is waited out rather than failing the command. Ordinary re-runs of a fetch
+  are unaffected: those go through the index and cost a request or two.
+- A run that has to read every job on the account now shows a progress counter on
+  stderr, so a long wait is distinguishable from a hang - most importantly on the
+  pass that happens just before a fetch offers to spend money. It draws only to a
+  terminal, leaving piped and redirected output byte-for-byte as it was, and stands
+  aside under `-v`, where the same progress goes to the log instead.
+- Log output is only coloured when stderr is a terminal. Redirecting the log to a
+  file used to write ANSI escape sequences into it.
 - `dbnget get JOB_ID` asks about that one job rather than fetching the entire
   account listing to find it.
 

@@ -19,7 +19,9 @@ use crate::{
     Outcome,
     cache::{Cache, RequestKey},
     cli::ListArgs,
-    lock, query, verify,
+    lock,
+    progress::Progress,
+    query, verify,
 };
 
 #[cfg(test)]
@@ -214,6 +216,11 @@ fn jitter_for(id: &str, attempt: u32) -> std::time::Duration {
 /// and stops buying anything.
 const FANOUT: usize = 4;
 
+/// How often the fan-out reports progress to the log, for runs where the meter is not
+/// drawing. Frequent enough that a long sweep visibly moves, sparse enough that it does
+/// not bury the lines someone turned `-v` on to read.
+const PROGRESS_LOG_EVERY: usize = 25;
+
 /// Fetches details for many jobs at once, preserving the order of `ids`.
 ///
 /// Each worker owns its own client because `HistoricalClient` needs `&mut self` for a
@@ -225,7 +232,7 @@ const FANOUT: usize = 4;
 /// listing must never reach the matcher, because a job missing from a sweep looks
 /// exactly like a job that does not match, and that is the difference between adopting
 /// and buying the data a second time.
-async fn details_many(key: &str, ids: &[String]) -> Result<Vec<BatchJob>> {
+async fn details_many(label: &'static str, key: &str, ids: &[String]) -> Result<Vec<BatchJob>> {
     if ids.len() <= 1 {
         // Not worth a task or a second client, and this is the common shape once the
         // request index is warm.
@@ -237,21 +244,52 @@ async fn details_many(key: &str, ids: &[String]) -> Result<Vec<BatchJob>> {
         return Ok(out);
     }
 
-    let chunk_size = ids.len().div_ceil(FANOUT).max(1);
+    // One request per job means minutes of silence on a long-lived account, and silence
+    // reads as a hang - most damagingly on the sweep, which runs just before a run
+    // offers to spend money. The meter draws only to a terminal and only when it is not
+    // fighting the log for stderr.
+    let progress = std::sync::Arc::new(Progress::start(label, ids.len()));
+
+    let total = ids.len();
+    debug!(jobs = total, "{label}");
+
+    let chunk_size = total.div_ceil(FANOUT).max(1);
     let mut workers = tokio::task::JoinSet::new();
     for (index, chunk) in ids.chunks(chunk_size).enumerate() {
         let key = key.to_owned();
         let chunk: Vec<String> = chunk.to_vec();
+        let progress = std::sync::Arc::clone(&progress);
         workers.spawn(async move {
             let mut client = crate::build_client(&key)?;
             let mut out = Vec::with_capacity(chunk.len());
             for id in &chunk {
                 out.push(details(&mut client, id).await?);
+                // The meter stands down when debug logging owns stderr, so the same
+                // progress goes out through the log. Otherwise `-v` would turn a
+                // three-minute wait from a moving counter into pure silence.
+                let done = progress.advance();
+                if done.is_multiple_of(PROGRESS_LOG_EVERY) {
+                    debug!(done, total, "still reading job details");
+                }
             }
             Ok::<_, anyhow::Error>((index, out))
         });
     }
 
+    let collected = collect_chunks(&mut workers).await;
+    // Erased on the way out whatever happened, so an error message never lands on top
+    // of a half-drawn counter.
+    progress.finish();
+    collected
+}
+
+/// Drains the workers, failing on the first one that failed.
+///
+/// Split out so the meter can be cleared on every exit from [`details_many`] rather than
+/// only the successful one.
+async fn collect_chunks(
+    workers: &mut tokio::task::JoinSet<Result<(usize, Vec<BatchJob>)>>,
+) -> Result<Vec<BatchJob>> {
     // Reassembled by chunk index so the result matches the vendor's ordering, which is
     // what `dbnget list` prints and what makes its output stable between runs.
     let mut chunks: Vec<(usize, Vec<BatchJob>)> = Vec::with_capacity(FANOUT);
@@ -274,7 +312,7 @@ async fn listed_details(
 ) -> Result<Vec<BatchJob>> {
     let short = short_listing(client, params).await?;
     let ids: Vec<String> = short.into_iter().map(|entry| entry.id).collect();
-    details_many(key, &ids).await
+    details_many("reading jobs", key, &ids).await
 }
 
 /// Proof that a COMPLETE live sweep of the account found nothing matching the request.
@@ -389,7 +427,10 @@ async fn sweep(
 ) -> Result<Reconciled> {
     debug!(jobs = short.len(), "sweeping every job on the account");
     let ids: Vec<String> = short.iter().map(|entry| entry.id.clone()).collect();
-    let jobs = details_many(key, &ids).await?;
+    // Named for what it is rather than for the mechanism. This runs immediately before
+    // a run offers to spend money, and "checking what you already bought" is the thing
+    // the user is waiting on.
+    let jobs = details_many("checking what you already bought", key, &ids).await?;
     for job in &jobs {
         // Populating from the sweep is what makes the next run cheap. The value written
         // is the vendor's own echo, which is the shape matching compares against.

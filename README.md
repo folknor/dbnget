@@ -401,6 +401,10 @@ Commands that must look at your whole account - `dbnget list`, and a fetch that 
 to buy something - are slower than they used to be, noticeably so on an account with a
 long history. Ordinary re-runs of a fetch are not: those go through the index.
 
+When one of those runs is going to take a while, a counter on stderr says how far along
+it is. It only draws to a terminal, so piping or redirecting output is unaffected, and
+it stands aside for `-v`, where the log reports the same progress instead.
+
 ## Verbosity
 
 `-v` is dbnget at debug, which is where the reconcile steps are: how many jobs were

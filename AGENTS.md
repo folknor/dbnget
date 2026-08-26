@@ -340,6 +340,9 @@ Detail lives in the code; this is the map.
   propose, what it may never decide, and why failure disables it rather than failing
   a command.
 - `lock.rs` - the exclusive claim on an output directory, held for a download.
+- `progress.rs` - the counter for the fan-out. Stderr only, terminal only, and it
+  stands down when debug logging owns the stream - so the fan-out reports progress
+  through the log as well, or `-v` would make a long run quieter than no flag at all.
 - `dataset.rs` - `dbnget list datasets` and `dbnget dataset` (range, schemas, unit
   prices, `--publishers`, filtered to the one dataset).
 - `spend.rs` - quoting and the spend gate.
