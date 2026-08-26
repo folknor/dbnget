@@ -13,8 +13,12 @@ use time::{OffsetDateTime, format_description::FormatItem, macros::format_descri
 
 use super::{SUBMITTED_COMPRESSION, SUBMITTED_SPLIT_DURATION, text_encoding_default};
 
-/// How much of the symbol list to show before summarising the rest.
-const SYMBOL_WIDTH: usize = 28;
+/// The whole width the selection cell is allowed, symbology prefix included.
+///
+/// Budgeting the CELL rather than just the symbol list is the point: the prefix is part
+/// of what has to fit, and sizing only the list let `parent:` push the cell past its
+/// column and shove every column after it out of alignment.
+const SELECTION_WIDTH: usize = 34;
 
 /// Names the columns, because two of them are byte counts that mean different things
 /// and one of them is the one people size a download by.
@@ -163,37 +167,75 @@ fn spelled(value: impl std::fmt::Debug) -> String {
 /// `ES.FUT` means nothing on its own: as a raw symbol it is one instrument that may not
 /// exist, and as a parent symbol it is every ES future. The stype belongs next to it.
 fn selection(job: &BatchJob) -> String {
-    format!("{}:{}", job.stype_in, summarize_symbols(&job.symbols))
+    let prefix = format!("{}:", job.stype_in);
+    let budget = SELECTION_WIDTH.saturating_sub(prefix.len());
+    format!("{prefix}{}", summarize_symbols(&job.symbols, budget))
 }
 
-/// Renders a symbol list short enough to sit in a column, without hiding how many were
-/// left out.
-fn summarize_symbols(symbols: &Symbols) -> String {
-    let names: Vec<String> = match symbols {
-        Symbols::All => return "ALL_SYMBOLS".to_owned(),
-        Symbols::Symbols(list) => list.clone(),
+/// The symbols in a job, one per element, in the order the vendor gave them.
+///
+/// Splitting on commas is the whole job here. The vendor is free to echo a multi-symbol
+/// selection back as a SINGLE comma-joined string, and it does: a 63-symbol `parent`
+/// request comes back as one element. Treating that as one symbol meant the summariser
+/// below saw a list of length one, had nothing to omit, and printed all 63 - which blew
+/// the column apart and carried every column after it off the screen.
+///
+/// `super::canonical_symbols` splits for the same reason and was fixed for it long ago;
+/// this path never was. It deliberately does NOT uppercase, sort or deduplicate the way
+/// canonicalization does - this is a display of what the vendor holds, so the order and
+/// spelling it reports are what should be shown.
+fn symbol_names(symbols: &Symbols) -> Vec<String> {
+    match symbols {
+        Symbols::All => vec![super::ALL_SYMBOLS.to_owned()],
+        Symbols::Symbols(list) => list
+            .iter()
+            .flat_map(|s| s.split(','))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
         Symbols::Ids(list) => list.iter().map(u32::to_string).collect(),
-    };
+    }
+}
+
+/// Renders a symbol list inside `budget` characters, without hiding how many were left
+/// out.
+///
+/// Works down from showing everything, because the remainder note takes room of its own
+/// and how much depends on how many are omitted - so the two cannot be decided
+/// independently. The first rendering that fits wins.
+fn summarize_symbols(symbols: &Symbols, budget: usize) -> String {
+    let names = symbol_names(symbols);
     if names.is_empty() {
         return "-".to_owned();
     }
 
-    let mut out = String::new();
-    let mut shown = 0;
-    for name in &names {
-        if !out.is_empty() && out.len() + name.len() + 1 > SYMBOL_WIDTH {
-            break;
+    for take in (1..=names.len()).rev() {
+        let head = names[..take].join(",");
+        let rendered = if take == names.len() {
+            head
+        } else {
+            format!("{head} +{} more", names.len() - take)
+        };
+        if rendered.len() <= budget {
+            return rendered;
         }
-        if !out.is_empty() {
-            out.push(',');
-        }
-        out.push_str(name);
-        shown += 1;
     }
-    if shown < names.len() {
-        out.push_str(&format!("+{}", names.len() - shown));
+    // Even one symbol does not fit, so a single name is longer than the whole cell.
+    // Cut it rather than let it overflow, and mark the cut.
+    ellipsize(&names[0], budget)
+}
+
+/// Shortens to `budget` characters, ending in a marker so a cut is never mistaken for
+/// the real value. Cuts on a character boundary: symbols are not obliged to be ASCII.
+fn ellipsize(value: &str, budget: usize) -> String {
+    const MARK: &str = "...";
+    if value.chars().count() <= budget {
+        return value.to_owned();
     }
-    out
+    let keep = budget.saturating_sub(MARK.len());
+    let head: String = value.chars().take(keep).collect();
+    format!("{head}{MARK}")
 }
 
 /// Byte counts as humans read them. Batch jobs run to tens of gigabytes, where a raw
@@ -229,28 +271,81 @@ mod tests {
     };
     use time::macros::datetime;
 
-    use super::{SYMBOL_WIDTH, human_bytes, range, shape, summarize_symbols};
+    use super::{
+        SELECTION_WIDTH, human_bytes, range, selection, shape, summarize_symbols, symbol_names,
+    };
     use crate::jobs::{
         fixtures::{job_from, params},
         job_matches,
     };
 
+    /// The budget every one of these tests measures against, standing in for the
+    /// symbology prefix the real cell also has to fit.
+    const BUDGET: usize = SELECTION_WIDTH - "parent:".len();
+
     #[test]
     fn short_symbol_lists_are_shown_whole() {
         let symbols = Symbols::Symbols(vec!["ES.FUT".to_owned(), "NQ.FUT".to_owned()]);
-        assert_eq!(summarize_symbols(&symbols), "ES.FUT,NQ.FUT");
-        assert_eq!(summarize_symbols(&Symbols::All), "ALL_SYMBOLS");
+        assert_eq!(summarize_symbols(&symbols, BUDGET), "ES.FUT,NQ.FUT");
+        assert_eq!(summarize_symbols(&Symbols::All, BUDGET), "ALL_SYMBOLS");
     }
 
     #[test]
     fn long_symbol_lists_say_how_many_were_omitted() {
         let names: Vec<String> = (0..20).map(|i| format!("SYM{i:02}")).collect();
-        let summary = summarize_symbols(&Symbols::Symbols(names));
+        let summary = summarize_symbols(&Symbols::Symbols(names), BUDGET);
         assert!(
-            summary.contains('+'),
+            summary.contains("more"),
             "{summary} should count the remainder"
         );
-        assert!(summary.len() <= SYMBOL_WIDTH + 4, "{summary} is too wide");
+        assert!(summary.len() <= BUDGET, "{summary} is too wide");
+    }
+
+    /// The defect that made a real listing unreadable. The vendor echoes a multi-symbol
+    /// selection as ONE comma-joined string, so the summariser saw a list of length one,
+    /// concluded there was nothing to omit, and printed all 63 symbols - blowing the
+    /// column apart and dragging every column after it off the screen.
+    #[test]
+    fn a_comma_joined_echo_is_split_before_it_is_summarised() {
+        let joined = "ES.FUT,MES.FUT,NQ.FUT,MNQ.FUT,RTY.FUT,M2K.FUT,YM.FUT,MYM.FUT,EMD.FUT";
+        let symbols = Symbols::Symbols(vec![joined.to_owned()]);
+
+        assert_eq!(symbol_names(&symbols).len(), 9, "the echo has to be split");
+
+        let summary = summarize_symbols(&symbols, BUDGET);
+        assert!(summary.len() <= BUDGET, "{summary} is too wide");
+        assert!(
+            summary.contains("more"),
+            "{summary} should count the remainder"
+        );
+        assert!(
+            !summary.contains("EMD.FUT"),
+            "{summary} should have been cut"
+        );
+    }
+
+    /// The whole cell has to fit its column, prefix included - sizing only the symbol
+    /// list let `parent:` push the row out of alignment.
+    #[test]
+    fn the_selection_cell_fits_its_column() {
+        let sixty_three: Vec<String> = (0..63).map(|i| format!("SYM{i:02}.FUT")).collect();
+        let job = job_from(&params(|p| {
+            p.symbols = Symbols::Symbols(vec![sixty_three.join(",")]);
+            p.stype_in = SType::Parent;
+        }));
+        let cell = selection(&job);
+        assert!(cell.len() <= SELECTION_WIDTH, "{cell} overflows its column");
+        assert!(cell.starts_with("parent:"), "{cell}");
+    }
+
+    /// A single symbol wider than the entire cell still must not overflow, and a cut
+    /// value must never be mistakable for the real one.
+    #[test]
+    fn one_oversized_symbol_is_cut_rather_than_allowed_to_overflow() {
+        let huge = "A".repeat(100);
+        let summary = summarize_symbols(&Symbols::Symbols(vec![huge]), BUDGET);
+        assert!(summary.len() <= BUDGET, "{summary} is too wide");
+        assert!(summary.ends_with("..."), "{summary} should mark the cut");
     }
 
     /// An intraday job rendered as bare dates is indistinguishable from a whole-day one,

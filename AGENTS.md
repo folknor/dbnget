@@ -136,8 +136,14 @@ Collapsing 3 into 0 or 1 destroys that workflow.
   fractions. Measured 2026-08-15: `XNAS.ITCH ohlcv-1m MSFT` for one day quotes
   `0.000479400158`, while the finished job for that same data reports `cost_usd: 0.0`.
   The earlier claim here that a covered request quotes exactly zero was FALSE against
-  the live API. The practical consequence is that the $0.00 default refuses nearly
-  everything with records in it, and that is accepted rather than fixed: rounding the
+  the live API. The practical consequence is that the $0.00 default refuses EVERY
+  request with records in it. Not nearly every one - every one. Unit prices are
+  positive, records mean a positive billable size, so the quote is positive and a $0.00
+  cap refuses it; "covered by the subscription" makes the BILL zero and leaves the list
+  price untouched, which is the whole reason this gate is blunt. The hedge that used to
+  be here said "nearly", and an almost-rule is useless for the thing this paragraph gets
+  consulted for: deciding whether some command is safe to run. It is a rule.
+  That is accepted rather than fixed: rounding the
   comparison to cents would make the default reachable by authorizing real sub-cent
   charges under a cap the user set to zero, and nothing available before a submit can
   tell "covered" from "cheap", so a `--free` mode would have nothing to compute.

@@ -218,7 +218,9 @@ pub async fn fetch(client: &mut HistoricalClient, params: &GetQueryParams) -> Re
 /// prices a request an active subscription covers identically to one nobody has paid
 /// for, and it answers in sub-cent fractions. A request whose finished job later shows
 /// `cost_usd: 0.0` quotes $0.000479 before it is submitted, so the default cap refuses
-/// essentially every request that holds records.
+/// EVERY request that holds records - not nearly every one. Unit prices are positive and
+/// records mean a positive billable size, so the quote is positive and a zero cap
+/// refuses it. Subscription coverage zeroes the BILL, never the quote.
 ///
 /// That is deliberately not papered over. Rounding the comparison to cents would make
 /// the default reachable by authorizing real sub-cent charges under a cap the user set
