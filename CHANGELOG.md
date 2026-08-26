@@ -30,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silent data loss in a file another program parses. CSV is RFC 4180 with a header
   row, so a comma-joined symbol list stays one quoted column rather than becoming
   sixty-three extra ones. `ids` prints bare job ids for `xargs -n1 dbnget get`.
+- `dbnget list` gains regex selectors: `--dataset`, `--schema`, `--symbol` and
+  `--job-id`, each repeatable. Repeating a flag widens the selection, combining flags
+  narrows it, and `--symbol` matches a job holding any matching symbol - each symbol
+  on its own, so a pattern can never span two of them. Patterns are unanchored and
+  case-insensitive, and are true regular expressions, so `.` is a wildcard even in
+  dotted names like `GLBX.MDP3`. `--job-id` is answered from the vendor's listing
+  without a request per job; the rest need each job's details.
+
+  With a limit, this means the most recent N jobs that MATCH, not the most recent N
+  filtered afterwards - dbnget works backwards until it has N matches, so
+  `--schema ohlcv-1d --limit 3` finds three even when the newest hundred jobs are
+  something else. Selectors run against live records only and never against the
+  request index, because this is the command you use to find out why something did
+  not match, and a local guess must not be what answers it.
 - `dbnget list --limit N` shows only the most recent N jobs, and applies the cap
   before fetching anything. The vendor returns every job in one response and offers
   no limit of its own, so the cost of a listing is one detail request per row - and

@@ -196,7 +196,13 @@ four fields above cover what anyone actually asks of a job list.
 3. ~~`--limit`.~~ DONE, and it is what makes `list` scale: 4 requests instead of 473 on
    a 472-job account.
 4. `--wide` to defeat table truncation. Not yet done.
-5. Regex selectors resolved against the index.
+5. ~~Regex selectors.~~ DONE, but NOT resolved against the index as this note proposed.
+   A review killed that: `RequestKey` is safe when under-specified only because it is
+   used for positive lookup, and this is the diagnostic surface, so a hint must not be
+   what hides a row. Selection is exact and the index stays write-only in `list`. The
+   same review found a real bug in the pipeline sketched here - capping rows before
+   filtering lets non-matching rows consume the limit - so selection now walks
+   newest-first and stops at N MATCHES.
 6. Paging.
 7. The bounded DEFAULT - still undecided between state-based and time-based, and less
    urgent now that `--limit` exists.

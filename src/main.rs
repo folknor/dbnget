@@ -2,6 +2,7 @@ mod cache;
 mod cli;
 mod dataset;
 mod fetch;
+mod filter;
 mod jobs;
 mod lock;
 mod progress;

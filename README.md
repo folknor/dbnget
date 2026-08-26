@@ -274,11 +274,44 @@ full record, because a truncation that helps in a column is a silent data loss i
 something else is going to parse. CSV is RFC 4180 with a header row, so the comma-joined
 symbol list stays one quoted column instead of becoming sixty-three extra ones.
 
+### Selecting jobs
+
+```sh
+dbnget list --schema '^ohlcv-1d$'
+dbnget list --dataset GLBX --symbol 'ES\.FUT' --limit 20
+dbnget list --job-id XNAS --format ids
+```
+
+`--dataset`, `--schema`, `--symbol` and `--job-id` each take a regex and each may be
+repeated. **Repeating a flag widens** (any of its patterns may match); **combining flags
+narrows** (every flag must be satisfied). `--symbol` selects a job if *any* of its
+symbols matches, and each symbol is matched on its own, so a pattern can never span two
+of them.
+
+Patterns are unanchored and case-insensitive: `--dataset GLBX` finds `GLBX.MDP3`, and
+`--schema OHLCV` finds `ohlcv-1m`. Anchor with `^…$` when you mean exactly.
+
+They are **true regular expressions**, which is worth remembering in a domain full of
+dotted names: `.` is a wildcard, so `--dataset GLBX.MDP3` would also match `GLBXaMDP3`.
+Write `GLBX\.MDP3` when the dot is meant literally.
+
+`--job-id` is the cheap one. A job id is in the vendor's listing, so it narrows without
+spending a request per job; the other three need each job's details.
+
+Selectors are exact. They are matched against the live record of every job considered,
+never against dbnget's local index. This is the command you use to work out why
+something did *not* match, so a cached guess is not allowed to answer it.
+
 `--limit N` matters more than it looks. The vendor returns every job on the account in a
 single response and offers no limit of its own, but the details behind each row cost one
 request apiece - so a listing's cost is the number of ROWS, and `--limit` is where that
 is decided. On an account with 472 jobs, `--limit 3` is four requests rather than 473.
-It keeps the most recent N, since the vendor sorts by submission time.
+It keeps the most recent N, ordered by submission time.
+
+With selectors, it means *the most recent N jobs that match* - not the most recent N
+jobs, filtered afterwards. dbnget works backwards through the account until it has found
+N matches, so `--schema ohlcv-1d --limit 3` returns three of them even when the newest
+hundred jobs are all something else.
 
 ## `dbnget get JOB_ID` - download a job by name
 

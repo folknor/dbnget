@@ -19,6 +19,7 @@ use crate::{
     Outcome,
     cache::{Cache, RequestKey},
     cli::ListArgs,
+    filter::Selectors,
     lock,
     progress::Progress,
     query, verify,
@@ -26,7 +27,7 @@ use crate::{
 
 #[cfg(test)]
 pub(crate) mod fixtures;
-mod render;
+pub(crate) mod render;
 
 pub use render::print_job;
 
@@ -56,11 +57,15 @@ pub async fn list(
         .maybe_since(since)
         .build();
 
-    // Live details for every job, never a cached value. `list` is the surface people
-    // use to work out WHY a request did not adopt an existing job, so a stale field
-    // here sends someone hunting a matcher bug that does not exist. A hint is not
-    // allowed to answer a diagnostic question.
-    let jobs = listed_details(client, key, &params, args.limit)
+    // Compiled before anything is fetched, so a typo in a pattern costs nothing.
+    let selectors = Selectors::compile(args)?;
+
+    // Live details for every job shown, and live records for every job SELECTED. `list`
+    // is the surface people use to work out WHY a request did not adopt an existing
+    // job, so neither what is rendered nor what is filtered out may come from a hint -
+    // a stale field sends someone hunting a matcher bug that does not exist, and a
+    // stale exclusion hides the evidence they came here for.
+    let jobs = listed_details(client, key, &params, &selectors, args.limit)
         .await
         .context("listing batch jobs")?;
     // Every row here was just fetched live, which is exactly what an index entry is
@@ -301,28 +306,107 @@ async fn listed_details(
     client: &mut HistoricalClient,
     key: &str,
     params: &ListJobsParams,
+    selectors: &Selectors,
     limit: Option<usize>,
 ) -> Result<Vec<BatchJob>> {
     let short = short_listing(client, params).await?;
-    let mut ids: Vec<String> = short.into_iter().map(|entry| entry.id).collect();
 
-    // Applied BEFORE the fan-out, which is the only reason the flag is worth having.
-    // The vendor returns every job in one response with no limit of its own, so
-    // trimming afterwards would save nothing - the cost is one detail request per row,
-    // and this is where that cost is decided. The vendor sorts by received-time, so the
-    // most recent jobs are the tail, and those are the ones anyone means by "the last
-    // twenty".
-    if let Some(limit) = limit
-        && ids.len() > limit
-    {
-        debug!(
-            total = ids.len(),
-            limit, "showing only the most recent jobs"
-        );
-        ids.drain(..ids.len() - limit);
+    // `--job-id` is answerable from the short record, so it prunes before a single
+    // detail request is spent. The other selectors need fields only a detail response
+    // carries.
+    let mut rows: Vec<BatchJobShort> = short
+        .into_iter()
+        .filter(|entry| selectors.accepts_id(&entry.id))
+        .collect();
+
+    // Ordered here rather than trusted from the response. The vendor documents the
+    // listing as sorted by received-time, but "the most recent twenty" is this
+    // command's promise and it should not rest silently on someone else's array order.
+    // The id breaks ties so the same account always renders the same window.
+    rows.sort_by(|a, b| {
+        b.ts_received
+            .cmp(&a.ts_received)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+
+    let mut jobs = collect_matching(key, &rows, selectors, limit).await?;
+    // Selected newest-first, rendered oldest-first: the window is the recent one, and a
+    // table still reads forwards in time inside it.
+    jobs.reverse();
+    Ok(jobs)
+}
+
+/// How many details to fetch per round when a limit is in play.
+///
+/// A round is fetched concurrently and then filtered, so the last round can overshoot
+/// by at most this many requests. Larger wastes more on a narrow filter; smaller gives
+/// up concurrency. A small multiple of the fan-out is the compromise.
+const SELECTION_ROUND: usize = FANOUT * 4;
+
+/// Fetches details newest-first and keeps the ones that match, stopping once `limit`
+/// MATCHING jobs have been found.
+///
+/// Stopping on matches rather than on rows fetched is the whole point, and getting it
+/// wrong is subtle: capping the rows first and filtering afterwards means rows that
+/// fail the filter consume the limit, so a listing can come back empty while a job that
+/// matches sits one row past the cap. That needs no stale cache and no bug anywhere
+/// else - a perfectly healthy account does it - and it makes `--limit` mean "the most
+/// recent N rows that MIGHT match" instead of "the most recent N that do".
+async fn collect_matching(
+    key: &str,
+    rows: &[BatchJobShort],
+    selectors: &Selectors,
+    limit: Option<usize>,
+) -> Result<Vec<BatchJob>> {
+    let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+
+    // Nothing to stop early for: fetch the lot in one fan-out.
+    let Some(limit) = limit else {
+        let jobs = details_many("reading jobs", key, &ids).await?;
+        return Ok(jobs.into_iter().filter(|j| selectors.accepts(j)).collect());
+    };
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    // Without content selectors every row matches, so the first `limit` rows are the
+    // answer and there is no reason to fetch in rounds.
+    if !selectors.needs_details() {
+        let head: Vec<String> = ids.into_iter().take(limit).collect();
+        return details_many("reading jobs", key, &head).await;
     }
 
-    details_many("reading jobs", key, &ids).await
+    let mut found: Vec<BatchJob> = Vec::with_capacity(limit);
+    for round in ids.chunks(SELECTION_ROUND) {
+        let jobs = details_many("searching jobs", key, round).await?;
+        if take_round(&mut found, jobs, selectors, limit) {
+            break;
+        }
+    }
+    debug!(matched = found.len(), limit, "selected jobs");
+    Ok(found)
+}
+
+/// Adds a round's matches and reports whether the limit is now satisfied.
+///
+/// Split out from the fetching so the stopping rule can be tested without a network.
+/// This is the logic the whole selection redesign exists for, and its failure mode is a
+/// listing that is quietly short rather than one that errors - which is exactly the kind
+/// of defect that survives review and is only caught by a test that names it.
+///
+/// Rounds arrive newest-first and filtering preserves order, so truncating keeps the
+/// newest matches and a match sitting at a round boundary cannot be lost.
+fn take_round(
+    found: &mut Vec<BatchJob>,
+    round: Vec<BatchJob>,
+    selectors: &Selectors,
+    limit: usize,
+) -> bool {
+    found.extend(round.into_iter().filter(|job| selectors.accepts(job)));
+    if found.len() >= limit {
+        found.truncate(limit);
+        return true;
+    }
+    false
 }
 
 /// Proof that a COMPLETE live sweep of the account found nothing matching the request.
@@ -561,6 +645,37 @@ fn same_symbols(left: &Symbols, right: &Symbols) -> bool {
 
 /// The sentinel meaning "every symbol in the dataset".
 pub const ALL_SYMBOLS: &str = "ALL_SYMBOLS";
+
+/// The symbols in a job, one per element, in the order the vendor gave them.
+///
+/// Splitting on commas is the whole job here. The vendor is free to echo a multi-symbol
+/// selection back as a SINGLE comma-joined string, and it does: a 63-symbol `parent`
+/// request comes back as one element. Treating that as one symbol made the listing print
+/// all 63 at once - which blew its column apart - and would let a `--symbol` pattern
+/// match ACROSS the boundary between two symbols, selecting a job on the strength of
+/// text no symbol in it contains.
+///
+/// This is domain normalization rather than presentation, which is why it lives beside
+/// the matcher and not in `render`. Selection and display both decompose a symbol list
+/// the same way, and a change made for how a table looks must not quietly change which
+/// jobs a filter selects.
+///
+/// It deliberately does NOT uppercase, sort or deduplicate the way [`canonical_symbols`]
+/// does. Canonicalization exists to compare two selections for equality; this reports
+/// what the vendor holds, so its order and spelling survive.
+pub fn symbol_names(symbols: &Symbols) -> Vec<String> {
+    match symbols {
+        Symbols::All => vec![ALL_SYMBOLS.to_owned()],
+        Symbols::Symbols(list) => list
+            .iter()
+            .flat_map(|s| s.split(','))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        Symbols::Ids(list) => list.iter().map(u32::to_string).collect(),
+    }
+}
 
 /// One symbol selection reduced to a comparable form: sorted, uppercased, deduplicated,
 /// and split on the commas the vendor may have joined it with.
@@ -801,6 +916,105 @@ mod tests {
         fixtures::{job_from, params},
         *,
     };
+
+    /// Builds a job with a distinguishing schema and id, so a selector can tell the
+    /// members of a round apart.
+    fn job_with(id: &str, schema: Schema) -> BatchJob {
+        let mut job = job_from(&params(|p| p.schema = schema));
+        job.id = id.to_owned();
+        job
+    }
+
+    fn schema_selector(pattern: &str) -> Selectors {
+        Selectors::compile(&crate::cli::ListArgs {
+            what: crate::cli::ListWhat::Jobs,
+            state: Vec::new(),
+            since: None,
+            dataset: Vec::new(),
+            schema: vec![pattern.to_owned()],
+            symbol: Vec::new(),
+            job_id: Vec::new(),
+            format: crate::cli::ListFormat::Table,
+            limit: None,
+        })
+        .expect("a valid pattern compiles")
+    }
+
+    /// The defect the round-based search exists to prevent, in the small: a round with
+    /// no matches must not end the search or consume the limit, or a listing comes back
+    /// empty while a matching job sits in the next round.
+    #[test]
+    fn a_round_with_no_matches_does_not_stop_the_search() {
+        let selectors = schema_selector("^ohlcv-1d$");
+        let mut found = Vec::new();
+
+        let barren = vec![job_with("A", Schema::Trades), job_with("B", Schema::Mbo)];
+        assert!(
+            !take_round(&mut found, barren, &selectors, 2),
+            "a round without matches must not satisfy the limit"
+        );
+        assert!(found.is_empty());
+
+        let fruitful = vec![
+            job_with("C", Schema::Ohlcv1D),
+            job_with("D", Schema::Ohlcv1D),
+        ];
+        assert!(take_round(&mut found, fruitful, &selectors, 2));
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].id, "C");
+    }
+
+    /// Rounds arrive newest-first, so truncating an overshooting round has to keep the
+    /// newest matches - the front of the accumulated list, not the back.
+    #[test]
+    fn an_overshooting_round_keeps_the_newest_matches() {
+        let selectors = schema_selector("^ohlcv-1d$");
+        let mut found = Vec::new();
+        let round = vec![
+            job_with("newest", Schema::Ohlcv1D),
+            job_with("middle", Schema::Ohlcv1D),
+            job_with("oldest", Schema::Ohlcv1D),
+        ];
+        assert!(take_round(&mut found, round, &selectors, 2));
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].id, "newest");
+        assert_eq!(found[1].id, "middle");
+    }
+
+    /// Matches spread across rounds accumulate rather than restarting, and the search
+    /// stops the moment the limit is met rather than one round later.
+    #[test]
+    fn matches_accumulate_across_rounds_and_stop_exactly_at_the_limit() {
+        let selectors = schema_selector("^ohlcv-1d$");
+        let mut found = Vec::new();
+
+        assert!(!take_round(
+            &mut found,
+            vec![job_with("A", Schema::Ohlcv1D), job_with("B", Schema::Mbo)],
+            &selectors,
+            3
+        ));
+        assert_eq!(found.len(), 1);
+
+        assert!(!take_round(
+            &mut found,
+            vec![job_with("C", Schema::Ohlcv1D)],
+            &selectors,
+            3
+        ));
+        assert_eq!(found.len(), 2);
+
+        assert!(take_round(
+            &mut found,
+            vec![job_with("D", Schema::Ohlcv1D)],
+            &selectors,
+            3
+        ));
+        assert_eq!(
+            found.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["A", "C", "D"]
+        );
+    }
 
     #[test]
     fn symbol_sets_ignore_order_and_case() {

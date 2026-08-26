@@ -207,6 +207,31 @@ pub struct ListArgs {
     #[arg(long, short = 'f', default_value = "table")]
     pub format: ListFormat,
 
+    /// Only show jobs whose dataset matches this regex. Repeatable.
+    ///
+    /// Patterns are TRUE REGEX, unanchored and case-insensitive, so `.` is a wildcard
+    /// even in dotted names: `GLBX.MDP3` also matches `GLBXaMDP3`. Escape it or anchor
+    /// the pattern when that matters.
+    #[arg(long)]
+    pub dataset: Vec<String>,
+
+    /// Only show jobs whose schema matches this regex. Repeatable.
+    #[arg(long)]
+    pub schema: Vec<String>,
+
+    /// Only show jobs holding a symbol matching this regex. Repeatable.
+    ///
+    /// Matched against each symbol separately, so a pattern cannot span two of them.
+    #[arg(long)]
+    pub symbol: Vec<String>,
+
+    /// Only show jobs whose id matches this regex. Repeatable.
+    ///
+    /// The cheap one: a job id is in the vendor's short listing, so this narrows the
+    /// listing without spending a request per job the way the others must.
+    #[arg(long = "job-id")]
+    pub job_id: Vec<String>,
+
     /// Show only the most recent N jobs.
     ///
     /// This is the flag that makes the command usable on an account with a long

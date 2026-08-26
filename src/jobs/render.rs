@@ -12,7 +12,7 @@ use databento::{
 use serde::Serialize;
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 
-use super::{SUBMITTED_COMPRESSION, SUBMITTED_SPLIT_DURATION, text_encoding_default};
+use super::{SUBMITTED_COMPRESSION, SUBMITTED_SPLIT_DURATION, symbol_names, text_encoding_default};
 use crate::cli::ListFormat;
 
 /// The whole width the selection cell is allowed, symbology prefix included.
@@ -436,32 +436,6 @@ fn selection(job: &BatchJob) -> String {
     let prefix = format!("{}:", job.stype_in);
     let budget = SELECTION_WIDTH.saturating_sub(prefix.len());
     format!("{prefix}{}", summarize_symbols(&job.symbols, budget))
-}
-
-/// The symbols in a job, one per element, in the order the vendor gave them.
-///
-/// Splitting on commas is the whole job here. The vendor is free to echo a multi-symbol
-/// selection back as a SINGLE comma-joined string, and it does: a 63-symbol `parent`
-/// request comes back as one element. Treating that as one symbol meant the summariser
-/// below saw a list of length one, had nothing to omit, and printed all 63 - which blew
-/// the column apart and carried every column after it off the screen.
-///
-/// `super::canonical_symbols` splits for the same reason and was fixed for it long ago;
-/// this path never was. It deliberately does NOT uppercase, sort or deduplicate the way
-/// canonicalization does - this is a display of what the vendor holds, so the order and
-/// spelling it reports are what should be shown.
-fn symbol_names(symbols: &Symbols) -> Vec<String> {
-    match symbols {
-        Symbols::All => vec![super::ALL_SYMBOLS.to_owned()],
-        Symbols::Symbols(list) => list
-            .iter()
-            .flat_map(|s| s.split(','))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-            .collect(),
-        Symbols::Ids(list) => list.iter().map(u32::to_string).collect(),
-    }
 }
 
 /// Renders a symbol list inside `budget` characters, without hiding how many were left

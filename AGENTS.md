@@ -75,6 +75,27 @@ the account was swept clean, and only the last may authorise a charge. A failed
 confirmation falls THROUGH to the sweep; a transport error propagates. "The vendor did
 not answer" and "the vendor says there is nothing" must never be the same value.
 
+`dbnget list`'s SELECTORS do not read the index either, and the reason is worth keeping.
+Filtering against it locally would make a filtered listing nearly free, and it is still
+wrong twice over. `RequestKey` is documented as safe when under-specified because a
+missing field only causes an EXTRA candidate that live confirmation rejects - true only
+while it is used to say "look here first". Used to say "this row does not match", an
+omitted or stale field becomes a row that silently vanishes. And this is the diagnostic
+surface, so a user investigating a suspected non-adoption could run the exact selector
+for it and be told `no jobs` because the same hint under suspicion hid the evidence.
+Re-checking against live records afterwards does not repair it: that stops false
+positives, and a row dropped before its fetch was never a positive. Cost is managed
+instead by fetching newest-first and stopping once `--limit` is satisfied. Note what
+that ordering buys: capping the ROWS and filtering afterwards lets non-matching rows
+consume the limit, so a listing comes back empty while a match sits one row past the
+cap - with a perfectly healthy index and no bug anywhere else.
+
+`jobs::symbol_names` lives beside the matcher rather than in `render` because both
+selection and display decompose a symbol list, and a change made for how a table looks
+must not quietly change which jobs a filter selects. It splits the vendor's comma-joined
+echo without uppercasing, sorting or deduplicating - that is `canonical_symbols`, which
+exists to compare two selections for equality rather than to report one.
+
 The index stores identity only - the match key, plus `id` and `ts_received` to join
 against the live listing. No state, no record count, no sizes, costs or processing
 timestamps: those move, the live listing already supplies state, and the confirming
@@ -345,6 +366,8 @@ Detail lives in the code; this is the map.
 - `cache.rs` - the untrusted request index under the XDG cache dir: what it may
   propose, what it may never decide, and why failure disables it rather than failing
   a command.
+- `filter.rs` - the `dbnget list` regex selectors, and why they never consult the
+  index.
 - `lock.rs` - the exclusive claim on an output directory, held for a download.
 - `progress.rs` - the counter for the fan-out. Stderr only, terminal only, and it
   stands down when debug logging owns the stream - so the fan-out reports progress

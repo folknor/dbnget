@@ -39,6 +39,10 @@ dirs = "6"
 # interrupted - anything we would have to clean up ourselves goes stale on the one path
 # where staleness is guaranteed to happen.
 fs4 = "1.1"
+# The `list` selectors. True regex rather than globs or substrings, so `.` is a
+# wildcard even in a domain full of dotted names - documented rather than papered over,
+# because half-magic matching is harder to reason about than a rule.
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
