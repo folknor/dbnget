@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The vendor client moves to `databento` 0.61 (DBN 0.69), which fixes a DBN
+  metadata miscount that could make the decoder read into the start of records. No
+  API surface changed; job matching is unaffected.
 - The vendor client moves to `databento` 0.60 (DBN 0.68) and hashing to `sha2`
   0.11. The job-matching fixtures build the submission and echoed-job structs as
   literals, so a new output-affecting submission field would have failed the build,

@@ -30,7 +30,7 @@ exclude = [
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
-databento = "0.60.0"
+databento = "0.61.0"
 # Locates the platform's cache directory, which on Linux honours `XDG_CACHE_HOME`.
 # Only ever used for the request index, which is a hint and never authoritative.
 dirs = "6"
