@@ -2,7 +2,7 @@
 name = "dbnget"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 description = "Command-line downloader for Databento historical market data"
 license = "MIT"
 repository = "https://github.com/folknor/dbnget"
@@ -33,7 +33,7 @@ clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 databento = "0.61.0"
 # Locates the platform's cache directory, which on Linux honours `XDG_CACHE_HOME`.
 # Only ever used for the request index, which is a hint and never authoritative.
-dirs = "6"
+dirs = "7.0.0"
 # Cross-platform advisory file locking. The lock has to be released by the operating
 # system when the process dies, because a download is exactly the thing that gets
 # interrupted - anything we would have to clean up ourselves goes stale on the one path
