@@ -380,8 +380,10 @@ Detail lives in the code; this is the map.
 
 ## Rules
 
-- Don't use gremlins! Em-dash, en-dash, strange quotes, whatever - all verboten.
-- Don't remind the user of the rules. They wrote them.
+### General rules
+
+- Don't use gremlins! Em-dash, en-dash, strange quotes, whatever - they're all verboten.
+- Don't remind the user of the rules. They wrote them, so they know them.
 - The user can exempt you from any rule at any time.
 - Never write a real API key into any file that is not `databento.key`, and never
   into documentation, tests, commit messages, or example output. Use an obviously
@@ -401,13 +403,18 @@ Detail lives in the code; this is the map.
   are all `deny`). Fix the code, don't loosen the lint. `#[expect(...)]` with a
   `reason` is acceptable in tests.
 
+### Bash rules
+
+- Never read or write from `/tmp`. All data lives in the project.
+- Never run raw `cargo`, `curl`, `pkill`. Use `brokkr`.
+
 ## Commands
 
-Use `brokkr` (not `cargo`) for check/test. Output is filtered to changed files and
-capped at 20 diagnostics per phase by default.
+Use `brokkr` (not `cargo`) for check/test. Output is never capped or scoped: every
+diagnostic prints every time, and errors in files with unstaged changes are listed
+first.
 
-- `brokkr check` - gremlins + clippy + all tests (changed-files scope)
-- `brokkr check --all` - every diagnostic, no cap, no scope filter
+- `brokkr check` - gremlins + clippy + all tests
 - `brokkr fmt` - run before every commit
 - `brokkr install` - installs the `dbnget` binary
 - `brokkr test <NAME>` - release-mode focused single-test runner; `<NAME>` is a
