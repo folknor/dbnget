@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The vendor client moves to `databento` 0.63 (DBN 0.71, zstd 0.14). The DBN record
+  header API and `RecordRefMut` soundness fixes in this range touch nothing dbnget
+  calls; the batched-decoding speedups apply to live and in-memory decoding, which
+  dbnget does not do. Job matching is unaffected.
 - The vendor client moves to `databento` 0.61 (DBN 0.69), which fixes a DBN
   metadata miscount that could make the decoder read into the start of records. No
   API surface changed; job matching is unaffected.
