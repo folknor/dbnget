@@ -1,5 +1,9 @@
-/target
-/.reference
-/scratch
-/databento.key
-/.brokkr
+target
+.reference
+scratch
+databento.key
+.brokkr
+.claude
+.maki
+.agents
+.codex
